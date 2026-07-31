@@ -1,0 +1,40 @@
+# --- Next.js dashboard (repo root) ---
+node_modules
+.next
+out
+build
+.DS_Store
+*.pem
+npm-debug.log*
+.vercel
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# --- Secrets ---
+# .env holds the bot's Zoho/Gmail credentials, .env.local the web app's.
+# Neither is ever committed; CI reads GitHub repo secrets, Amplify reads its
+# own console variables.
+.env
+.env.local
+.env*.local
+.env.production
+
+# --- Python bot (bot/) ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Playwright / run artifacts. Scoped to the repo root on purpose: a blanket
+# *.png would also swallow public/icons/, and the PWA needs those committed.
+/failure.png
+/*.png
+playwright-report/
+test-results/
+!public/**/*.png
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+Thumbs.db

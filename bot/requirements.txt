@@ -1,0 +1,5 @@
+playwright==1.48.0
+python-dotenv==1.0.1
+
+# Mail is read over IMAP with the stdlib (imaplib + email), so there is no
+# HTTP or auth-library dependency for the OTP step.

@@ -1,0 +1,55 @@
+# AWS Amplify Hosting build specification for the Neural Control dashboard.
+#
+# Monorepo note: this repo also contains bot/ (Python + Playwright), which
+# Amplify neither installs nor runs. The bot is executed only by GitHub Actions
+# (.github/workflows/automation.yml). Amplify sees package.json at the root,
+# detects Next.js, and provisions the SSR compute layer.
+#
+# Environment variables (DATABASE_URL, DISPATCH_SECRET, DISPATCH_PIN, GITHUB_*)
+# are set in the Amplify console under "Environment variables" — never here.
+# The SSR Lambda does not inherit console variables automatically, so the
+# preBuild phase writes them into .env.production, which `next build` bundles
+# and the runtime reads. Anything omitted below is simply absent at runtime.
+version: 1
+frontend:
+  phases:
+    preBuild:
+      commands:
+        # `npm ci` can fail with EEXIST/ENOENT in ~/.npm/_cacache when Amplify
+        # restores a corrupt/racy npm cache. Retry once with a cleaned cache so
+        # a transient corruption self-heals instead of failing the build.
+        - npm ci || (npm cache clean --force && npm ci)
+        # --- Database ---
+        - echo "DATABASE_URL=$DATABASE_URL" >> .env.production
+        # --- Dispatch security ---
+        # DISPATCH_SECRET authenticates cron callers of POST /api/dispatch and
+        # signs the security gate's unlock cookie. DISPATCH_PIN arms the gate;
+        # if it is unset the console renders "Gate off" and manual dispatch is
+        # ungated — set it before exposing this deployment to anyone.
+        - echo "DISPATCH_SECRET=$DISPATCH_SECRET" >> .env.production
+        - echo "DISPATCH_PIN=$DISPATCH_PIN" >> .env.production
+        # --- Downstream driver: GitHub Actions ---
+        # GITHUB_* is NOT a reserved prefix in Amplify (unlike AWS_*), so these
+        # can be set with their real names in the console.
+        - echo "GITHUB_TOKEN=$GITHUB_TOKEN" >> .env.production
+        - echo "GITHUB_OWNER=$GITHUB_OWNER" >> .env.production
+        - echo "GITHUB_REPO=$GITHUB_REPO" >> .env.production
+        - echo "GITHUB_WORKFLOW_ID=$GITHUB_WORKFLOW_ID" >> .env.production
+        - echo "GITHUB_REF=$GITHUB_REF" >> .env.production
+        # --- Optional generic webhook driver (takes precedence when set) ---
+        - echo "DISPATCH_WEBHOOK_URL=$DISPATCH_WEBHOOK_URL" >> .env.production
+        - echo "DISPATCH_WEBHOOK_SECRET=$DISPATCH_WEBHOOK_SECRET" >> .env.production
+        # NEXT_PUBLIC_* is inlined at build time, so it must exist before the
+        # build phase — not just at runtime.
+        - echo "NEXT_PUBLIC_ENVIRONMENT=$NEXT_PUBLIC_ENVIRONMENT" >> .env.production
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .next/cache/**/*

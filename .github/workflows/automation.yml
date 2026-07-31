@@ -1,0 +1,141 @@
+name: Automation
+
+# Monorepo layout: the Python bot lives in bot/, the Next.js dashboard at the
+# repo root. Every path below is relative to the repo root, so the bot/ prefix
+# is required.
+
+on:
+  schedule:
+    # GitHub cron is always UTC and may be delayed under load.
+    - cron: '49 3 * * 1-5'  # 9:19 AM IST (Monday-Friday)
+    - cron: '47 13 * * 1-5' # 7:17 PM IST (Monday-Friday)
+  workflow_dispatch:
+    # These inputs mirror exactly what the dashboard sends in
+    # lib/github.ts -> dispatchGitHub(). workflow_dispatch rejects the whole
+    # call with 422 "Unexpected inputs provided" if an input is not declared
+    # here, so this list and that payload must stay in step.
+    inputs:
+      action:
+        description: "ACTION_ALPHA (morning) or ACTION_BETA (evening)"
+        required: false
+        default: ACTION_ALPHA
+        type: choice
+        options:
+          - ACTION_ALPHA
+          - ACTION_BETA
+      run_id:
+        description: "Dispatch log id from the dashboard, for correlation"
+        required: false
+        type: string
+      bypass_delay:
+        description: "\"true\" when the operator skipped the random delay"
+        required: false
+        type: string
+      delay_ms:
+        description: "Jitter the dashboard already waited out, in ms"
+        required: false
+        type: string
+      source:
+        description: "MANUAL or CRON — who asked for this run"
+        required: false
+        type: string
+      form_url:
+        description: "Override the Zoho sign-in URL (data centre)"
+        required: false
+        type: string
+
+# Only one run at a time; a queued run supersedes an in-flight one.
+concurrency:
+  group: automation
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      # Zoho People credentials, from repo secrets.
+      ZOHO_EMAIL: ${{ secrets.ZOHO_EMAIL }}
+      ZOHO_PASSWORD: ${{ secrets.ZOHO_PASSWORD }}
+      # Gmail IMAP: address + 16-char app password, both from repo secrets.
+      GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+      GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+      FORM_URL: ${{ inputs.form_url }}
+      HEADLESS: "true"
+      PYTHONUNBUFFERED: "1"
+      # Passed through for logging/correlation with the dashboard's log row.
+      # The bot only self-jitters on `schedule` runs, so a manual dispatch that
+      # already waited out its delay in the browser does not wait twice.
+      DISPATCH_ACTION: ${{ inputs.action }}
+      DISPATCH_RUN_ID: ${{ inputs.run_id }}
+      DISPATCH_SOURCE: ${{ inputs.source }}
+      DISPATCH_DELAY_MS: ${{ inputs.delay_ms }}
+      DISPATCH_BYPASS_DELAY: ${{ inputs.bypass_delay }}
+
+      # --- Dashboard as the source of truth ---
+      # Base URL of the deployed console, e.g. https://main.xxxx.amplifyapp.com
+      # On a scheduled run the bot asks it two questions before doing anything:
+      # is today a holiday exception, and is this weekday still enabled. There
+      # is deliberately no SKIP_DATES secret — the holiday_exceptions table and
+      # the schedule matrix already answer both, and a second copy here would
+      # drift from what the calendar UI shows.
+      # Unset = the bot skips the check and runs (fails open, logs loudly).
+      CONTROL_CENTER_URL: ${{ secrets.CONTROL_CENTER_URL }}
+      # Sent as a bearer token on those reads. The endpoints are open today;
+      # this is already correct if they are ever locked down.
+      DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
+
+      # --- Optional: Telegram run notifications ---
+      # Both must be set for delivery; unset means notifications are simply off.
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r bot/requirements.txt
+
+      # Cache the browser binaries; the key tracks the pinned Playwright version.
+      - name: Cache Playwright browsers
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('bot/requirements.txt') }}
+
+      - name: Install Playwright browsers and system dependencies
+        run: playwright install --with-deps chromium
+
+      # Run from the repo root so the bot's cwd-relative paths (.env lookup and
+      # failure.png) resolve where the upload step below expects them.
+      - name: Run Playwright bot
+        run: python bot/bot.py
+
+      # `always()`, not `failure()`: success.png only exists when the run
+      # succeeded, so a failure-only condition could never upload it. This also
+      # keeps the evidence for a cancelled or timed-out run.
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-screenshots
+          path: |
+            failure.png
+            success.png
+          if-no-files-found: ignore
+          retention-days: 7
