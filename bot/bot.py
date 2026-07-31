@@ -35,6 +35,7 @@ import random
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -893,8 +894,17 @@ def _parse_timer_spans(page: Page) -> tuple[Optional[int], Optional[str]]:
     return hours * 3600 + minutes * 60 + seconds, raw
 
 
-def read_attendance(page: Page) -> AttendanceSnapshot:
-    """Read the attendance widget. Never raises — an unreadable widget is data."""
+# My Space is an SPA: #totalInTime and #att_status are in the DOM, with an
+# empty status and a 00:00:00 placeholder, *before* the XHR that fills them
+# lands. wait_for(state="attached") is satisfied by that placeholder, so a read
+# taken the moment the page arrives reports a confident 0h 0m for a day with
+# hours on it - which also makes verify_checkout_eligibility abort a perfectly
+# legitimate check-out. So the widget is polled until it fills in.
+WIDGET_SETTLE_TIMEOUT = 20  # seconds
+
+
+def _read_attendance_once(page: Page) -> AttendanceSnapshot:
+    """One read of the widget, placeholders and all. Never raises."""
     status: Optional[str] = None
     try:
         status_el = page.locator(ATT_STATUS_SELECTOR).first
@@ -909,7 +919,33 @@ def read_attendance(page: Page) -> AttendanceSnapshot:
         log.warning("Could not read %s.", TOTAL_TIME_SELECTOR)
         seconds, raw = None, None
 
-    snapshot = AttendanceSnapshot(status, seconds, raw)
+    return AttendanceSnapshot(status, seconds, raw)
+
+
+def read_attendance(page: Page) -> AttendanceSnapshot:
+    """
+    Read the attendance widget once it has loaded its data.
+
+    A zero timer is indistinguishable from the pre-load placeholder, so both
+    are treated as "not settled yet" and polled. Waiting out the full timeout
+    is not a failure - a genuine 0h 0m (nobody has checked in yet today) looks
+    exactly the same, and is reported as such. Never raises: an unreadable
+    widget is data the dashboard should see, not a crash.
+    """
+    deadline = time.monotonic() + WIDGET_SETTLE_TIMEOUT
+    snapshot = _read_attendance_once(page)
+
+    while not (snapshot.status and snapshot.seconds):
+        if time.monotonic() >= deadline:
+            log.info(
+                "Widget still reads %s after %ds; taking it as final.",
+                snapshot.describe(),
+                WIDGET_SETTLE_TIMEOUT,
+            )
+            break
+        page.wait_for_timeout(1_000)
+        snapshot = _read_attendance_once(page)
+
     log.info("Attendance widget: %s", snapshot.describe())
     return snapshot
 
@@ -945,6 +981,19 @@ def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             log.info("Reported attendance to the dashboard (HTTP %s).", response.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            # The endpoint only rejects when it *has* a secret and ours does not
+            # match, so this is always a config mismatch, never a transient fault.
+            log.warning(
+                "Dashboard rejected the attendance report (401). DISPATCH_SECRET "
+                "%s here and must match the value the deployed console has; set "
+                "the same string in both the GitHub repo secrets and the Amplify "
+                "environment variables.",
+                "is set" if secret else "is NOT set",
+            )
+        else:
+            log.warning("Could not report attendance to the dashboard: %s", exc)
     except Exception as exc:  # noqa: BLE001 - reporting must never fail a run
         log.warning("Could not report attendance to the dashboard: %s", exc)
 
