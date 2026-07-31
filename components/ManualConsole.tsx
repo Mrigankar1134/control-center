@@ -4,9 +4,11 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
   CheckCircle2,
+  Clock,
   Lock,
   Moon,
   Play,
+  RefreshCw,
   ShieldCheck,
   Sunrise,
   X,
@@ -30,7 +32,7 @@ import {
   MAX_MANUAL_DELAY_MS,
   TOOLTIPS,
 } from "@/lib/constants";
-import { useTicker } from "@/lib/hooks";
+import { useMounted, useTicker } from "@/lib/hooks";
 import { formatWhen, nextDispatch } from "@/lib/schedule";
 import type {
   DispatchResponse,
@@ -38,7 +40,12 @@ import type {
   LogRow,
   ScheduleRow,
 } from "@/lib/types";
-import { cn, formatDuration, formatRelativeTime } from "@/lib/utils";
+import {
+  cn,
+  formatDuration,
+  formatHoursMinutes,
+  formatRelativeTime,
+} from "@/lib/utils";
 
 type Phase = "idle" | "queued" | "executing" | "success" | "failed";
 
@@ -67,12 +74,15 @@ export function ManualConsole({
   logs,
   environment,
   onDispatched,
+  onRefreshLogs,
 }: {
   schedule: ScheduleRow[];
   exceptions: ExceptionRow[];
   logs: LogRow[];
   environment: string;
   onDispatched: () => void;
+  /** Pulls the latest run status so the logged total can be re-derived. */
+  onRefreshLogs?: () => Promise<void>;
 }) {
   // Mobile shows one action at a time; desktop shows both side by side.
   const [mobileAction, setMobileAction] =
@@ -128,6 +138,9 @@ export function ManualConsole({
           />
         </div>
 
+        {/* Sits above both dispatch buttons — the day's total in one line. */}
+        <LoggedTimeBar logs={logs} onRefresh={onRefreshLogs} />
+
         <div className="grid divide-y divide-[var(--border-subtle)] md:grid-cols-2 md:divide-x md:divide-y-0">
           {(["ACTION_ALPHA", "ACTION_BETA"] as const).map((action) => (
             <ActionPanel
@@ -159,6 +172,132 @@ export function ManualConsole({
           />
         )}
       </AnimatePresence>
+    </div>
+  );
+}
+
+interface LoggedTime {
+  /** Null until a check-in has been recorded today. */
+  ms: number | null;
+  checkIn: Date | null;
+  checkOut: Date | null;
+}
+
+/**
+ * The logged total is derived from the runs themselves: the first successful
+ * Alpha of the day opens the interval, the last successful Beta closes it.
+ * While Beta has not run, the total keeps counting from the check-in.
+ */
+function loggedTimeToday(logs: LogRow[]): LoggedTime {
+  const startOfDay = new Date();
+  startOfDay.setHours(0, 0, 0, 0);
+
+  let checkIn: Date | null = null;
+  let checkOut: Date | null = null;
+
+  for (const log of logs) {
+    if (log.status !== "SUCCESS") continue;
+    const at = new Date(log.timestamp);
+    if (Number.isNaN(at.getTime()) || at < startOfDay) continue;
+
+    if (log.actionType === "ACTION_ALPHA") {
+      if (!checkIn || at < checkIn) checkIn = at;
+    } else if (log.actionType === "ACTION_BETA") {
+      if (!checkOut || at > checkOut) checkOut = at;
+    }
+  }
+
+  if (!checkIn) return { ms: null, checkIn: null, checkOut };
+
+  const end = checkOut && checkOut > checkIn ? checkOut : new Date();
+  return { ms: end.getTime() - checkIn.getTime(), checkIn, checkOut };
+}
+
+function clockOf(date: Date): string {
+  return date.toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+/** Logged total for today, with an explicit pull of the latest run status. */
+function LoggedTimeBar({
+  logs,
+  onRefresh,
+}: {
+  logs: LogRow[];
+  onRefresh?: () => Promise<void>;
+}) {
+  const mounted = useMounted();
+  const [fetching, setFetching] = React.useState(false);
+  const [checkedAt, setCheckedAt] = React.useState<Date | null>(null);
+
+  // Keeps the open-ended total moving between log polls.
+  useTicker(30_000);
+
+  const logged = React.useMemo(
+    () => (mounted ? loggedTimeToday(logs) : { ms: null, checkIn: null, checkOut: null }),
+    // Recomputed each ticker frame via `mounted` + logs identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [logs, mounted],
+  );
+
+  const running = logged.checkIn !== null && logged.checkOut === null;
+
+  async function check() {
+    if (!onRefresh || fetching) return;
+    setFetching(true);
+    try {
+      await onRefresh();
+      setCheckedAt(new Date());
+    } finally {
+      setFetching(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3 border-b border-[var(--border-subtle)] px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex items-center gap-1.5">
+          <Clock className="h-3.5 w-3.5 text-content-disabled" aria-hidden />
+          <p className="eyebrow">Time logged today</p>
+        </div>
+
+        <p
+          className="tabular mt-1 font-mono text-section-title font-semibold text-content-primary"
+          aria-live="polite"
+        >
+          {mounted ? formatHoursMinutes(logged.ms) : "--:--"}
+          {running && (
+            <span className="ml-2 align-middle text-support font-sans font-normal text-warning">
+              still counting
+            </span>
+          )}
+        </p>
+
+        <p className="mt-0.5 text-support text-content-muted">
+          {logged.checkIn
+            ? `Check-in ${clockOf(logged.checkIn)} · ${
+                logged.checkOut
+                  ? `check-out ${clockOf(logged.checkOut)}`
+                  : "no check-out yet"
+              }`
+            : "No successful check-in recorded today."}
+          {checkedAt && ` · updated ${clockOf(checkedAt)}`}
+        </p>
+      </div>
+
+      <Button
+        variant="secondary"
+        size="sm"
+        onClick={() => void check()}
+        loading={fetching}
+        disabled={!onRefresh}
+        icon={<RefreshCw className="h-3.5 w-3.5" aria-hidden />}
+        className="w-full sm:w-auto"
+      >
+        {fetching ? "Checking…" : "Check logged time"}
+      </Button>
     </div>
   );
 }

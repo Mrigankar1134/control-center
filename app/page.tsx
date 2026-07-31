@@ -139,6 +139,7 @@ function Dashboard() {
                 logs={logs.logs}
                 environment={ENVIRONMENT}
                 onDispatched={refreshAll}
+                onRefreshLogs={logs.refresh}
               />
             </div>
 
@@ -195,6 +196,7 @@ function Dashboard() {
             logs={logs.logs}
             environment={ENVIRONMENT}
             onDispatched={refreshAll}
+            onRefreshLogs={logs.refresh}
           />
           <div className="grid gap-5 lg:grid-cols-2">
             <ExecutionActivity

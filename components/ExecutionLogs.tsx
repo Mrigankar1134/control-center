@@ -9,6 +9,7 @@ import {
   ImageOff,
   Inbox,
   Loader2,
+  Maximize2,
   Minus,
   Plus,
   RefreshCw,
@@ -19,7 +20,7 @@ import * as React from "react";
 
 import { Badge, StatusBadge } from "@/components/ui/badge";
 import { Button, IconButton } from "@/components/ui/button";
-import { Drawer } from "@/components/ui/dialog";
+import { Drawer, Modal } from "@/components/ui/dialog";
 import { EmptyState } from "@/components/ui/empty-state";
 import { Panel, PanelHeader } from "@/components/ui/panel";
 import { Segmented } from "@/components/ui/segmented";
@@ -339,6 +340,10 @@ function InspectionDrawer({
 }) {
   const { toast } = useToast();
   const failed = log?.status === "FAILED";
+  const artifact = React.useMemo(
+    () => (log ? resolveArtifact(log) : null),
+    [log],
+  );
 
   async function copyDetails() {
     if (!log) return;
@@ -458,11 +463,13 @@ function InspectionDrawer({
                 Failure artifact
                 <InfoHint content={TOOLTIPS.artifact} label="About artifacts" />
               </h3>
-              {log.artifactUrl ? (
-                isRenderableImage(log.artifactUrl) ? (
-                  <ArtifactViewer url={log.artifactUrl} />
+              {artifact ? (
+                artifact.kind === "image" ? (
+                  <ArtifactViewer url={artifact.url} runUrl={artifact.runUrl} />
+                ) : artifact.kind === "github" ? (
+                  <GitHubArtifactLink url={artifact.url} />
                 ) : (
-                  <RunLink url={log.artifactUrl} />
+                  <RunLink url={artifact.url} />
                 )
               ) : (
                 <div className="flex items-center gap-3 rounded-control border border-[var(--border-subtle)] bg-white/[0.02] px-4 py-5">
@@ -592,10 +599,86 @@ function isRenderableImage(url: string): boolean {
   }
 }
 
+function isGitHubActions(url: string): boolean {
+  return /^https:\/\/github\.com\/[^/]+\/[^/]+\/actions/.test(url);
+}
+
+/** Payload keys a runner is likely to hang a direct screenshot URL off. */
+const IMAGE_PAYLOAD_KEYS = [
+  "screenshotUrl",
+  "screenshot_url",
+  "screenshot",
+  "imageUrl",
+  "image_url",
+  "image",
+  "artifactImageUrl",
+  "previewUrl",
+  "preview_url",
+];
+
+type Artifact =
+  | { kind: "image"; url: string; runUrl: string | null }
+  | { kind: "github"; url: string }
+  | { kind: "link"; url: string };
+
+/**
+ * Resolves what the drawer can actually show. A direct image wins wherever it
+ * comes from — `artifactUrl` itself, or an S3/Cloudinary/base64 URL the runner
+ * attached to the payload — because that is the only case an <img> can render.
+ * A GitHub Actions URL is a page, not a file, so it becomes a link out.
+ */
+function resolveArtifact(log: LogRow): Artifact | null {
+  const direct = log.artifactUrl;
+
+  if (direct && isRenderableImage(direct)) {
+    return { kind: "image", url: direct, runUrl: null };
+  }
+
+  const payload = log.payload ?? {};
+  for (const key of IMAGE_PAYLOAD_KEYS) {
+    const value = payload[key];
+    if (typeof value === "string" && isRenderableImage(value)) {
+      return {
+        kind: "image",
+        url: value,
+        // The run page stays reachable alongside the inline screenshot.
+        runUrl: direct && isGitHubActions(direct) ? direct : null,
+      };
+    }
+  }
+
+  if (!direct) return null;
+  return isGitHubActions(direct)
+    ? { kind: "github", url: direct }
+    : { kind: "link", url: direct };
+}
+
+/**
+ * GitHub artifacts are zipped and behind auth — there is nothing to embed, so
+ * the honest affordance is a single action that leaves the app.
+ */
+function GitHubArtifactLink({ url }: { url: string }) {
+  return (
+    <div className="rounded-control border border-[var(--border-subtle)] bg-white/[0.02] px-4 py-4">
+      <p className="text-support leading-relaxed text-content-muted">
+        Screenshots are uploaded to the workflow run as a zipped artifact.
+        GitHub requires sign-in to download them, so they cannot be shown here.
+      </p>
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="mt-3 inline-flex h-9 select-none items-center justify-center gap-1.5 whitespace-nowrap rounded-control border border-[var(--border-default)] bg-white/[0.05] px-3 text-support text-content-primary transition-all duration-press hover:-translate-y-px hover:border-[var(--border-strong)] hover:bg-white/[0.09] active:translate-y-0 focus-ring"
+      >
+        <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
+        View Run Artifacts on GitHub
+      </a>
+    </div>
+  );
+}
+
 /** Escape hatch for artifacts that live behind a page rather than at a URL. */
 function RunLink({ url }: { url: string }) {
-  const isActions = /github\.com\/.+\/actions/.test(url);
-
   return (
     <a
       href={url}
@@ -609,20 +692,26 @@ function RunLink({ url }: { url: string }) {
       />
       <span className="min-w-0">
         <span className="block text-body text-content-primary">
-          {isActions ? "Open the run in GitHub Actions" : "Open the artifact"}
+          Open the artifact
         </span>
         <span className="mt-0.5 block break-all text-support text-content-muted">
-          {isActions
-            ? "Screenshots are attached to the run as a downloadable artifact; GitHub requires sign-in, so they cannot be shown inline here."
-            : url}
+          {url}
         </span>
       </span>
     </a>
   );
 }
 
-function ArtifactViewer({ url }: { url: string }) {
+function ArtifactViewer({
+  url,
+  runUrl,
+}: {
+  url: string;
+  /** Present when the screenshot came from the payload of a GitHub run. */
+  runUrl?: string | null;
+}) {
   const [zoom, setZoom] = React.useState(1);
+  const [lightbox, setLightbox] = React.useState(false);
   const [status, setStatus] = React.useState<"loading" | "ready" | "error">(
     "loading",
   );
@@ -630,6 +719,7 @@ function ArtifactViewer({ url }: { url: string }) {
   React.useEffect(() => {
     setZoom(1);
     setStatus("loading");
+    setLightbox(false);
   }, [url]);
 
   const clamp = (value: number) => Math.min(4, Math.max(1, value));
@@ -664,17 +754,38 @@ function ArtifactViewer({ url }: { url: string }) {
           >
             <RotateCcw className="h-3.5 w-3.5" aria-hidden />
           </IconButton>
+          <IconButton
+            label="Expand artifact"
+            onClick={() => setLightbox(true)}
+            disabled={status === "error"}
+            className="h-8 w-8"
+          >
+            <Maximize2 className="h-3.5 w-3.5" aria-hidden />
+          </IconButton>
         </div>
 
-        <a
-          href={url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-support text-content-muted transition-colors hover:bg-white/[0.05] hover:text-content-primary focus-ring"
-        >
-          Open original
-          <ExternalLink className="h-3 w-3" aria-hidden />
-        </a>
+        <div className="flex items-center gap-1">
+          {runUrl && (
+            <a
+              href={runUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-support text-content-muted transition-colors hover:bg-white/[0.05] hover:text-content-primary focus-ring"
+            >
+              GitHub run
+              <ExternalLink className="h-3 w-3" aria-hidden />
+            </a>
+          )}
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-support text-content-muted transition-colors hover:bg-white/[0.05] hover:text-content-primary focus-ring"
+          >
+            Open original
+            <ExternalLink className="h-3 w-3" aria-hidden />
+          </a>
+        </div>
       </div>
 
       <div className="relative h-[300px] overflow-auto">
@@ -709,14 +820,40 @@ function ArtifactViewer({ url }: { url: string }) {
             onError={() => setStatus("error")}
             style={{ transform: `scale(${zoom})` }}
             className={cn(
-              "block w-full origin-top-left transition-transform duration-200",
+              "block w-full origin-top-left cursor-zoom-in transition-transform duration-200",
               status === "loading" && "opacity-0",
-              zoom > 1 ? "cursor-grab" : "cursor-zoom-in",
             )}
-            onClick={() => setZoom((z) => clamp(z >= 4 ? 1 : z + 0.5))}
+            onClick={() => setLightbox(true)}
           />
         )}
       </div>
+
+      {/* Full-bleed preview; the modal is centred and capped at the viewport. */}
+      <Modal
+        open={lightbox}
+        onOpenChange={setLightbox}
+        title="Failure artifact"
+        description="Screenshot captured when this dispatch failed."
+        className="max-w-4xl"
+        footer={
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex h-9 select-none items-center justify-center gap-1.5 whitespace-nowrap rounded-control border border-[var(--border-default)] bg-white/[0.05] px-3 text-support text-content-primary transition-colors hover:bg-white/[0.09] focus-ring"
+          >
+            <ExternalLink className="h-3.5 w-3.5 shrink-0" aria-hidden />
+            Open original
+          </a>
+        }
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={url}
+          alt="Screenshot captured when this dispatch failed"
+          className="mx-auto block h-auto w-full rounded-control"
+        />
+      </Modal>
     </div>
   );
 }

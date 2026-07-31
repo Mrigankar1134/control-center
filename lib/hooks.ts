@@ -259,31 +259,44 @@ export function useLogs(): UseLogsResult {
   const [loading, setLoading] = React.useState(true);
   const [refreshing, setRefreshing] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const inFlight = React.useRef(false);
+  // Holds the running request so a manual refresh can await the poll already
+  // in flight rather than resolving instantly against stale data.
+  const inFlight = React.useRef<Promise<void> | null>(null);
 
   const refresh = React.useCallback(async () => {
-    if (inFlight.current) return;
-    inFlight.current = true;
-    setRefreshing(true);
-    try {
-      const response = await fetch(`/api/logs?limit=${LOG_HISTORY_SIZE}`, {
-        cache: "no-store",
-      });
-      const data = (await response.json()) as {
-        logs?: LogRow[];
-        error?: string;
-      };
-      if (!response.ok || !data.logs) {
-        throw new Error(data.error ?? `HTTP ${response.status}`);
+    if (inFlight.current) {
+      await inFlight.current;
+      return;
+    }
+
+    const request = (async () => {
+      setRefreshing(true);
+      try {
+        const response = await fetch(`/api/logs?limit=${LOG_HISTORY_SIZE}`, {
+          cache: "no-store",
+        });
+        const data = (await response.json()) as {
+          logs?: LogRow[];
+          error?: string;
+        };
+        if (!response.ok || !data.logs) {
+          throw new Error(data.error ?? `HTTP ${response.status}`);
+        }
+        setLogs(data.logs);
+        setError(null);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setRefreshing(false);
+        setLoading(false);
       }
-      setLogs(data.logs);
-      setError(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    })();
+
+    inFlight.current = request;
+    try {
+      await request;
     } finally {
-      inFlight.current = false;
-      setRefreshing(false);
-      setLoading(false);
+      inFlight.current = null;
     }
   }, []);
 

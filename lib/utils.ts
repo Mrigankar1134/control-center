@@ -41,6 +41,15 @@ export function formatDuration(ms: number | null | undefined): string {
   return `${(ms / 1000).toFixed(2)}s`;
 }
 
+/** 29_700_000 -> "08h 15m". Null renders the placeholder clock. */
+export function formatHoursMinutes(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined || ms < 0) return "--:--";
+  const minutes = Math.floor(ms / 60_000);
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}h ${String(
+    minutes % 60,
+  ).padStart(2, "0")}m`;
+}
+
 /** Guards the HH:mm strings coming out of the time pickers. */
 export function isValidTime(value: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);

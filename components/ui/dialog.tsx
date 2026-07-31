@@ -102,6 +102,32 @@ export function Drawer({
   );
 }
 
+/**
+ * Modal backdrop. Unlike the drawer overlay, this one is also the centring
+ * container: the content is rendered *inside* it so mobile browsers centre the
+ * panel against the real viewport instead of a translated box that can drift
+ * off-screen when the URL bar collapses.
+ */
+const CenteringOverlay = React.forwardRef<
+  HTMLDivElement,
+  { children: React.ReactNode }
+>(function CenteringOverlay({ children }, ref) {
+  return (
+    <DialogPrimitive.Overlay asChild forceMount>
+      <motion.div
+        ref={ref}
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        transition={{ duration: 0.18 }}
+        className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto p-4 bg-black/50 backdrop-blur-sm"
+      >
+        {children}
+      </motion.div>
+    </DialogPrimitive.Overlay>
+  );
+});
+
 /** Centred modal used for the two-stage action model. */
 export function Modal({
   open,
@@ -125,50 +151,49 @@ export function Modal({
       {open && (
         <DialogPrimitive.Root open onOpenChange={onOpenChange}>
           <DialogPrimitive.Portal forceMount>
-            <Overlay />
-            <DialogPrimitive.Content asChild forceMount>
-              <motion.div
-                initial={{ opacity: 0, scale: 0.97, y: 8 }}
-                animate={{ opacity: 1, scale: 1, y: 0 }}
-                exit={{ opacity: 0, scale: 0.97, y: 4 }}
-                transition={{ duration: 0.2, ease: [0.32, 0.72, 0, 1] }}
-                className={cn(
-                  "fixed left-1/2 top-1/2 z-50 flex max-h-[88vh] w-[calc(100%-2rem)] max-w-lg -translate-x-1/2 -translate-y-1/2 flex-col rounded-panel border border-[var(--border-strong)] bg-bg-elevated shadow-elevated focus:outline-none",
-                  className,
-                )}
-              >
-                <header className="flex items-start justify-between gap-4 border-b border-[var(--border-subtle)] px-5 py-4">
-                  <div className="min-w-0">
-                    <DialogPrimitive.Title className="text-card-title font-semibold text-content-primary">
-                      {title}
-                    </DialogPrimitive.Title>
-                    {description && (
-                      <DialogPrimitive.Description className="mt-1 text-support leading-relaxed text-content-muted">
-                        {description}
-                      </DialogPrimitive.Description>
-                    )}
-                  </div>
-                  <DialogPrimitive.Close
-                    aria-label="Cancel"
-                    className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-control text-content-muted transition-colors hover:bg-white/[0.06] hover:text-content-primary focus-ring"
-                  >
-                    <X className="h-4 w-4" aria-hidden />
-                  </DialogPrimitive.Close>
-                </header>
+            <CenteringOverlay>
+              <DialogPrimitive.Content asChild forceMount>
+                <motion.div
+                  initial={{ opacity: 0, scale: 0.97, y: 8 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.97, y: 4 }}
+                  transition={{ duration: 0.2, ease: [0.32, 0.72, 0, 1] }}
+                  className={cn(
+                    "relative z-50 mx-auto my-auto flex max-h-[90vh] w-full max-w-md flex-col overflow-y-auto rounded-panel border border-[var(--border-strong)] bg-bg-elevated shadow-elevated focus:outline-none",
+                    className,
+                  )}
+                >
+                  <header className="flex items-start justify-between gap-4 border-b border-[var(--border-subtle)] px-5 py-4">
+                    <div className="min-w-0">
+                      <DialogPrimitive.Title className="text-card-title font-semibold text-content-primary">
+                        {title}
+                      </DialogPrimitive.Title>
+                      {description && (
+                        <DialogPrimitive.Description className="mt-1 text-support leading-relaxed text-content-muted">
+                          {description}
+                        </DialogPrimitive.Description>
+                      )}
+                    </div>
+                    <DialogPrimitive.Close
+                      aria-label="Cancel"
+                      className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-control text-content-muted transition-colors hover:bg-white/[0.06] hover:text-content-primary focus-ring"
+                    >
+                      <X className="h-4 w-4" aria-hidden />
+                    </DialogPrimitive.Close>
+                  </header>
 
-                {children && (
-                  <div className="flex-1 overflow-y-auto px-5 py-4">
-                    {children}
-                  </div>
-                )}
+                  {children && (
+                    <div className="flex-1 px-5 py-4">{children}</div>
+                  )}
 
-                {footer && (
-                  <footer className="flex flex-col-reverse gap-2 border-t border-[var(--border-subtle)] px-5 py-4 sm:flex-row sm:justify-end">
-                    {footer}
-                  </footer>
-                )}
-              </motion.div>
-            </DialogPrimitive.Content>
+                  {footer && (
+                    <footer className="flex flex-col-reverse gap-2 border-t border-[var(--border-subtle)] px-5 py-4 sm:flex-row sm:justify-end">
+                      {footer}
+                    </footer>
+                  )}
+                </motion.div>
+              </DialogPrimitive.Content>
+            </CenteringOverlay>
           </DialogPrimitive.Portal>
         </DialogPrimitive.Root>
       )}
