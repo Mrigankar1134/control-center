@@ -61,7 +61,10 @@ export function Drawer({
                 exit={{ x: "100%" }}
                 transition={{ duration: 0.26, ease: [0.32, 0.72, 0, 1] }}
                 className={cn(
-                  "fixed right-0 top-0 z-50 flex h-full w-full flex-col border-l border-[var(--border-default)] bg-bg-elevated shadow-elevated focus:outline-none sm:max-w-xl",
+                  // pad-safe-*: installed to the home screen the drawer covers
+                  // the whole physical screen, so its own header would sit
+                  // under the status bar and its footer under the home bar.
+                  "pad-safe-top pad-safe-bottom fixed right-0 top-0 z-50 flex h-full w-full flex-col border-l border-[var(--border-default)] bg-bg-elevated shadow-elevated focus:outline-none sm:max-w-xl",
                   className,
                 )}
               >
@@ -120,7 +123,8 @@ const CenteringOverlay = React.forwardRef<
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
         transition={{ duration: 0.18 }}
-        className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto p-4 bg-black/50 backdrop-blur-sm"
+        /* inset-safe is p-4, floored to the device's safe-area insets. */
+        className="inset-safe fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/50 backdrop-blur-sm"
       >
         {children}
       </motion.div>

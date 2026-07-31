@@ -149,7 +149,9 @@ function ToastViewport({
     <div
       role="region"
       aria-label="Notifications"
-      className="pointer-events-none fixed bottom-4 right-4 z-[80] flex w-[calc(100%-2rem)] max-w-sm flex-col gap-2.5 sm:bottom-5 sm:right-5"
+      /* Clears the mobile bottom nav and the home-indicator inset; on lg the
+         nav is gone, so the stack drops back to the corner. */
+      className="pointer-events-none fixed bottom-[calc(4.5rem+env(safe-area-inset-bottom,0px))] right-4 z-[80] flex w-[calc(100%-2rem)] max-w-sm flex-col gap-2.5 sm:right-5 lg:bottom-5"
     >
       <AnimatePresence initial={false}>
         {toasts.map((t) => {

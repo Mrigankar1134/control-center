@@ -15,6 +15,14 @@ on:
     # call with 422 "Unexpected inputs provided" if an input is not declared
     # here, so this list and that payload must stay in step.
     inputs:
+      mode:
+        description: "PUNCH (check in/out) or STATUS_CHECK (read the widget only)"
+        required: false
+        default: PUNCH
+        type: choice
+        options:
+          - PUNCH
+          - STATUS_CHECK
       action:
         description: "ACTION_ALPHA (morning) or ACTION_BETA (evening)"
         required: false
@@ -44,9 +52,10 @@ on:
         required: false
         type: string
 
-# Only one run at a time; a queued run supersedes an in-flight one.
+# One punch run at a time. Status checks get their own lane so a read-only
+# look at the widget can never sit behind — or delay — an actual punch.
 concurrency:
-  group: automation
+  group: automation-${{ inputs.mode || 'PUNCH' }}
   cancel-in-progress: false
 
 permissions:
@@ -70,6 +79,9 @@ jobs:
       # Passed through for logging/correlation with the dashboard's log row.
       # The bot only self-jitters on `schedule` runs, so a manual dispatch that
       # already waited out its delay in the browser does not wait twice.
+      # STATUS_CHECK signs in, reads the attendance widget, reports it to the
+      # dashboard and stops — it never clicks the punch button.
+      DISPATCH_MODE: ${{ inputs.mode }}
       DISPATCH_ACTION: ${{ inputs.action }}
       DISPATCH_RUN_ID: ${{ inputs.run_id }}
       DISPATCH_SOURCE: ${{ inputs.source }}

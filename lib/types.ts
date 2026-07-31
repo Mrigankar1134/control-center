@@ -36,7 +36,21 @@ export interface ExceptionRow {
   createdAt: string;
 }
 
-export type TerminalLevel = "INFO" | "SUCCESS" | "WARN" | "ERROR" | "SYSTEM";
+/**
+ * Serialized `attendance_snapshots` row — what Zoho's widget showed when the
+ * bot last looked. `loggedSeconds` is a duration, not a clock time; only
+ * `capturedAt` is an instant, and it is always displayed as IST.
+ */
+export interface AttendanceSnapshot {
+  capturedAt: string;
+  status: string | null;
+  loggedSeconds: number | null;
+  rawTime: string | null;
+  source: string | null;
+  runId: string | null;
+}
+
+export type TerminalLevel ="INFO" | "SUCCESS" | "WARN" | "ERROR" | "SYSTEM";
 
 /** One line emitted by GET /api/dispatch/stream. */
 export interface TerminalLine {

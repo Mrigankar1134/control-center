@@ -88,7 +88,9 @@ async function dispatchGitHub(
 ): Promise<DispatchResult> {
   const { token, owner, repo } = creds;
   const workflowId = process.env.GITHUB_WORKFLOW_ID;
-  const ref = process.env.GITHUB_REF || "main";
+  // "master" matches this repo's default branch; a dispatch against a ref that
+  // does not exist is rejected with 422.
+  const ref = process.env.GITHUB_REF || "master";
 
   const headers: Record<string, string> = {
     Accept: "application/vnd.github+json",
@@ -136,6 +138,61 @@ async function dispatchGitHub(
     artifactUrl: response.ok
       ? `https://github.com/${owner}/${repo}/actions`
       : null,
+  };
+}
+
+/**
+ * Fires a read-only run that signs in to Zoho, reads the attendance widget and
+ * POSTs it back to /api/attendance. Nothing is punched.
+ *
+ * This is the only way the dashboard can see the widget: it lives behind an
+ * authenticated session on Zoho's origin, so the browser in CI is the reader.
+ * Only the workflow driver can do it — a generic webhook has no such contract,
+ * and there is nothing to check against in a simulated run.
+ */
+export async function triggerStatusCheck(): Promise<{
+  ok: boolean;
+  detail?: string;
+}> {
+  const token = process.env.GITHUB_TOKEN;
+  const owner = process.env.GITHUB_OWNER;
+  const repo = process.env.GITHUB_REPO;
+  const workflowId = process.env.GITHUB_WORKFLOW_ID;
+
+  if (!token || !owner || !repo || !workflowId) {
+    return {
+      ok: false,
+      detail:
+        "A live check needs GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO and GITHUB_WORKFLOW_ID — only the workflow driver can read the Zoho widget.",
+    };
+  }
+
+  const response = await fetchWithTimeout(
+    `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${workflowId}/dispatches`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: JSON.stringify({
+        ref: process.env.GITHUB_REF || "master",
+        inputs: {
+          mode: "STATUS_CHECK",
+          source: "MANUAL",
+        },
+      }),
+    },
+  );
+
+  if (response.ok) return { ok: true };
+
+  const text = await safeText(response);
+  return {
+    ok: false,
+    detail: text || `GitHub responded ${response.status} ${response.statusText}`,
   };
 }
 

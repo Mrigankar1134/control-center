@@ -32,7 +32,7 @@ import {
   MAX_MANUAL_DELAY_MS,
   TOOLTIPS,
 } from "@/lib/constants";
-import { useMounted, useTicker } from "@/lib/hooks";
+import { useAttendance, useMounted, useTicker } from "@/lib/hooks";
 import { formatWhen, nextDispatch } from "@/lib/schedule";
 import type {
   DispatchResponse,
@@ -44,6 +44,7 @@ import {
   cn,
   formatDuration,
   formatHoursMinutes,
+  formatIstClock,
   formatRelativeTime,
 } from "@/lib/utils";
 
@@ -74,16 +75,17 @@ export function ManualConsole({
   logs,
   environment,
   onDispatched,
-  onRefreshLogs,
 }: {
   schedule: ScheduleRow[];
   exceptions: ExceptionRow[];
   logs: LogRow[];
   environment: string;
   onDispatched: () => void;
-  /** Pulls the latest run status so the logged total can be re-derived. */
-  onRefreshLogs?: () => Promise<void>;
 }) {
+  // Owned here rather than passed in: the widget reading belongs to the
+  // dispatch console, and nothing above it needs the polling state.
+  const attendance = useAttendance();
+
   // Mobile shows one action at a time; desktop shows both side by side.
   const [mobileAction, setMobileAction] =
     React.useState<ActionType>("ACTION_ALPHA");
@@ -139,7 +141,7 @@ export function ManualConsole({
         </div>
 
         {/* Sits above both dispatch buttons — the day's total in one line. */}
-        <LoggedTimeBar logs={logs} onRefresh={onRefreshLogs} />
+        <LoggedTimeBar attendance={attendance} />
 
         <div className="grid divide-y divide-[var(--border-subtle)] md:grid-cols-2 md:divide-x md:divide-y-0">
           {(["ACTION_ALPHA", "ACTION_BETA"] as const).map((action) => (
@@ -176,84 +178,40 @@ export function ManualConsole({
   );
 }
 
-interface LoggedTime {
-  /** Null until a check-in has been recorded today. */
-  ms: number | null;
-  checkIn: Date | null;
-  checkOut: Date | null;
+/** A reading older than this is called out rather than shown as current. */
+const STALE_AFTER_MS = 15 * 60_000;
+
+/** "In" is the widget's own word for a running clock. */
+function isPunchedIn(status: string | null): boolean {
+  return /^in$/i.test((status ?? "").trim());
 }
 
 /**
- * The logged total is derived from the runs themselves: the first successful
- * Alpha of the day opens the interval, the last successful Beta closes it.
- * While Beta has not run, the total keeps counting from the check-in.
+ * What Zoho's attendance widget last reported, and a button that sends CI to
+ * look again. The value is never derived from our own dispatch log — a
+ * dispatch says a button was clicked, not that Zoho counted the time.
  */
-function loggedTimeToday(logs: LogRow[]): LoggedTime {
-  const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
-
-  let checkIn: Date | null = null;
-  let checkOut: Date | null = null;
-
-  for (const log of logs) {
-    if (log.status !== "SUCCESS") continue;
-    const at = new Date(log.timestamp);
-    if (Number.isNaN(at.getTime()) || at < startOfDay) continue;
-
-    if (log.actionType === "ACTION_ALPHA") {
-      if (!checkIn || at < checkIn) checkIn = at;
-    } else if (log.actionType === "ACTION_BETA") {
-      if (!checkOut || at > checkOut) checkOut = at;
-    }
-  }
-
-  if (!checkIn) return { ms: null, checkIn: null, checkOut };
-
-  const end = checkOut && checkOut > checkIn ? checkOut : new Date();
-  return { ms: end.getTime() - checkIn.getTime(), checkIn, checkOut };
-}
-
-function clockOf(date: Date): string {
-  return date.toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/** Logged total for today, with an explicit pull of the latest run status. */
 function LoggedTimeBar({
-  logs,
-  onRefresh,
+  attendance,
 }: {
-  logs: LogRow[];
-  onRefresh?: () => Promise<void>;
+  attendance: ReturnType<typeof useAttendance>;
 }) {
   const mounted = useMounted();
-  const [fetching, setFetching] = React.useState(false);
-  const [checkedAt, setCheckedAt] = React.useState<Date | null>(null);
+  const { snapshot, loading, checking } = attendance;
 
-  // Keeps the open-ended total moving between log polls.
+  // Re-renders the staleness note as the reading ages.
   useTicker(30_000);
 
-  const logged = React.useMemo(
-    () => (mounted ? loggedTimeToday(logs) : { ms: null, checkIn: null, checkOut: null }),
-    // Recomputed each ticker frame via `mounted` + logs identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [logs, mounted],
-  );
+  const capturedAt = snapshot ? new Date(snapshot.capturedAt) : null;
+  const stale =
+    mounted && capturedAt
+      ? Date.now() - capturedAt.getTime() > STALE_AFTER_MS
+      : false;
 
-  const running = logged.checkIn !== null && logged.checkOut === null;
-
-  async function check() {
-    if (!onRefresh || fetching) return;
-    setFetching(true);
-    try {
-      await onRefresh();
-      setCheckedAt(new Date());
-    } finally {
-      setFetching(false);
-    }
-  }
+  const value =
+    snapshot?.loggedSeconds != null
+      ? formatHoursMinutes(snapshot.loggedSeconds * 1000)
+      : "--:--";
 
   return (
     <div className="flex flex-col gap-3 border-b border-[var(--border-subtle)] px-5 py-3.5 sm:flex-row sm:items-center sm:justify-between">
@@ -261,42 +219,42 @@ function LoggedTimeBar({
         <div className="flex items-center gap-1.5">
           <Clock className="h-3.5 w-3.5 text-content-disabled" aria-hidden />
           <p className="eyebrow">Time logged today</p>
+          {snapshot?.status && (
+            <Badge tone={isPunchedIn(snapshot.status) ? "success" : "beta"} size="sm">
+              {snapshot.status}
+            </Badge>
+          )}
         </div>
 
         <p
           className="tabular mt-1 font-mono text-section-title font-semibold text-content-primary"
           aria-live="polite"
         >
-          {mounted ? formatHoursMinutes(logged.ms) : "--:--"}
-          {running && (
-            <span className="ml-2 align-middle text-support font-sans font-normal text-warning">
-              still counting
-            </span>
-          )}
+          {loading ? "--:--" : value}
         </p>
 
         <p className="mt-0.5 text-support text-content-muted">
-          {logged.checkIn
-            ? `Check-in ${clockOf(logged.checkIn)} · ${
-                logged.checkOut
-                  ? `check-out ${clockOf(logged.checkOut)}`
-                  : "no check-out yet"
-              }`
-            : "No successful check-in recorded today."}
-          {checkedAt && ` · updated ${clockOf(checkedAt)}`}
+          {checking
+            ? "Signing in to Zoho — this takes about a minute."
+            : loading
+              ? "Loading the last reading…"
+              : !capturedAt
+                ? "Zoho has not been read yet. Check now to pull the current total."
+                : `As of ${formatIstClock(capturedAt)} IST${
+                    snapshot?.source === "STATUS_CHECK" ? "" : " (from the last run)"
+                  }${stale ? " · may be out of date" : ""}`}
         </p>
       </div>
 
       <Button
         variant="secondary"
         size="sm"
-        onClick={() => void check()}
-        loading={fetching}
-        disabled={!onRefresh}
+        onClick={() => void attendance.check()}
+        loading={checking}
         icon={<RefreshCw className="h-3.5 w-3.5" aria-hidden />}
         className="w-full sm:w-auto"
       >
-        {fetching ? "Checking…" : "Check logged time"}
+        {checking ? "Checking Zoho…" : "Check logged time"}
       </Button>
     </div>
   );

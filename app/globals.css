@@ -151,6 +151,27 @@
     -ms-overflow-style: none;
     scrollbar-width: none;
   }
+
+  /*
+   * Installed to the home screen, the app runs with viewport-fit=cover and a
+   * translucent status bar: the viewport starts at the physical top of the
+   * screen, so anything anchored to top: 0 renders *under* the clock and the
+   * carrier icons. Every such surface pads itself by the inset instead. The
+   * value is 0 in a normal browser tab, so these are inert on desktop.
+   */
+  .pad-safe-top {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+  .pad-safe-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  /* For overlays that already carry their own padding. */
+  .inset-safe {
+    padding-top: max(1rem, env(safe-area-inset-top, 0px));
+    padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px));
+    padding-left: max(1rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1rem, env(safe-area-inset-right, 0px));
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -72,7 +72,8 @@ export function AppShell({
   }));
 
   return (
-    <div className="min-h-screen pb-20 lg:pb-0">
+    // Bottom padding clears the fixed nav *and* the home-indicator inset.
+    <div className="min-h-screen pb-[calc(5rem+env(safe-area-inset-bottom,0px))] lg:pb-0">
       <TopBar
         systemStatus={systemStatus}
         view={view}
@@ -115,7 +116,7 @@ function TopBar({
   const status = STATUS_META[systemStatus];
 
   return (
-    <header className="sticky top-0 z-40 border-b border-[var(--border-subtle)] bg-bg-primary/85 backdrop-blur-xl">
+    <header className="pad-safe-top sticky top-0 z-40 border-b border-[var(--border-subtle)] bg-bg-primary/85 backdrop-blur-xl">
       <div className="mx-auto flex h-14 w-full max-w-[1440px] items-center gap-4 px-4 sm:px-6 lg:px-8">
         <div className="flex min-w-0 items-center gap-2.5">
           <Hexagon

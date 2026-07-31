@@ -13,12 +13,13 @@ import {
   WEEKDAYS,
 } from "@/lib/constants";
 import type {
+  AttendanceSnapshot,
   AuditRow,
   ExceptionRow,
   LogRow,
   ScheduleRow,
 } from "@/lib/types";
-import { isValidTime } from "@/lib/utils";
+import { isValidTime, sleep } from "@/lib/utils";
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -307,6 +308,138 @@ export function useLogs(): UseLogsResult {
   }, [refresh]);
 
   return { logs, loading, refreshing, error, refresh };
+}
+
+/** How long to wait for CI to sign in to Zoho and report back. */
+const STATUS_CHECK_TIMEOUT_MS = 240_000;
+const STATUS_CHECK_POLL_MS = 6_000;
+
+export interface UseAttendanceResult {
+  snapshot: AttendanceSnapshot | null;
+  loading: boolean;
+  /** True from the moment a live check is asked for until it lands or times out. */
+  checking: boolean;
+  error: string | null;
+  check: () => Promise<void>;
+  refresh: () => Promise<void>;
+}
+
+/**
+ * The Zoho attendance widget, as last seen by the bot.
+ *
+ * The dashboard cannot read Zoho itself, so "check now" fires a read-only CI
+ * run and then waits for a snapshot stamped after the request — that arrival,
+ * not the API call, is what completing the check means.
+ */
+export function useAttendance(): UseAttendanceResult {
+  const { toast } = useToast();
+  const [snapshot, setSnapshot] = React.useState<AttendanceSnapshot | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [checking, setChecking] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const alive = React.useRef(true);
+  React.useEffect(
+    () => () => {
+      alive.current = false;
+    },
+    [],
+  );
+
+  const load = React.useCallback(async (): Promise<AttendanceSnapshot | null> => {
+    try {
+      const response = await fetch("/api/attendance", { cache: "no-store" });
+      const data = (await response.json()) as {
+        snapshot?: AttendanceSnapshot | null;
+        error?: string;
+      };
+      if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+      const next = data.snapshot ?? null;
+      if (alive.current) {
+        setSnapshot(next);
+        setError(null);
+      }
+      return next;
+    } catch (err) {
+      if (alive.current) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+      return null;
+    } finally {
+      if (alive.current) setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  const check = React.useCallback(async () => {
+    setChecking(true);
+    setError(null);
+    const requestedAt = Date.now();
+
+    try {
+      const response = await fetch("/api/attendance/check", { method: "POST" });
+      const data = (await response.json()) as { error?: string };
+      if (!response.ok) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+      toast({
+        title: "Checking Zoho",
+        description:
+          "A read-only run is signing in to read the attendance widget. This usually takes about a minute.",
+        variant: "info",
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (alive.current) {
+        setError(message);
+        setChecking(false);
+      }
+      toast({
+        title: "Could not start the check",
+        description: message,
+        variant: "error",
+        duration: 9000,
+      });
+      return;
+    }
+
+    // Poll for a reading newer than the request — an older row is the previous
+    // run's number and would look like a successful, instant refresh.
+    const deadline = requestedAt + STATUS_CHECK_TIMEOUT_MS;
+    while (alive.current && Date.now() < deadline) {
+      await sleep(STATUS_CHECK_POLL_MS);
+      const latest = await load();
+      if (latest && new Date(latest.capturedAt).getTime() > requestedAt) {
+        if (alive.current) setChecking(false);
+        toast({
+          title: "Logged time updated",
+          description: latest.rawTime
+            ? `Zoho reports ${latest.rawTime} logged today.`
+            : "Zoho responded, but the timer could not be read.",
+          variant: "success",
+        });
+        return;
+      }
+    }
+
+    if (alive.current) setChecking(false);
+    toast({
+      title: "The check did not report back",
+      description:
+        "The run may still be waiting on a sign-in code, or it failed. Check the workflow run on GitHub.",
+      variant: "error",
+      duration: 9000,
+    });
+  }, [load, toast]);
+
+  const refresh = React.useCallback(async () => {
+    await load();
+  }, [load]);
+
+  return { snapshot, loading, checking, error, check, refresh };
 }
 
 export interface UseExceptionsResult {

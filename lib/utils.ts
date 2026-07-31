@@ -50,6 +50,21 @@ export function formatHoursMinutes(ms: number | null | undefined): string {
   ).padStart(2, "0")}m`;
 }
 
+/**
+ * Clock time in IST, regardless of where the browser is. Attendance is kept in
+ * Indian office hours, so a viewer in another zone must not see a shifted
+ * "as of" stamp against a Zoho reading.
+ */
+export function formatIstClock(input: string | Date): string {
+  const date = typeof input === "string" ? new Date(input) : input;
+  if (Number.isNaN(date.getTime())) return "—";
+  return date.toLocaleTimeString("en-GB", {
+    timeZone: "Asia/Kolkata",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 /** Guards the HH:mm strings coming out of the time pickers. */
 export function isValidTime(value: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);

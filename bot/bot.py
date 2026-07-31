@@ -790,39 +790,168 @@ def randomize_start() -> None:
     time.sleep(delay_seconds)
 
 
-def verify_checkout_eligibility(page: Page) -> None:
-    """Read the elapsed time from Zoho and ensure it is >= 9.5 hours."""
-    # ⚠️ CRITICAL: You must update this selector to point to the element on 
-    # your Zoho dashboard that displays your total hours today (e.g., "09:35").
-    time_locator = page.locator(".ZpHoursToday") # Example placeholder selector
-    
-    try:
-        log.info("Looking for elapsed time on the dashboard...")
-        time_locator.wait_for(state="visible", timeout=10_000)
-        time_text = time_locator.inner_text().strip()
-        
-        # This regex extracts the hours and minutes whether Zoho shows "09:45", "09h 45m", or "9 hrs 45 mins"
-        match = re.search(r"(\d+)\s*[:hH]\s*(\d+)", time_text)
+# Zoho People's "My Space" attendance widget. The timer is three sibling
+# <span>s inside #totalInTime holding HH, MM and SS - reading innerText of the
+# container yields "070447", so the spans are read individually.
+TOTAL_TIME_SELECTOR = "#totalInTime"
+ATT_STATUS_SELECTOR = "#att_status"
+
+# Hours that must be logged before the bot is allowed to check out.
+REQUIRED_MINUTES = 9 * 60 + 30
+
+
+class AttendanceSnapshot:
+    """What the attendance widget showed at one moment."""
+
+    def __init__(self, status: Optional[str], seconds: Optional[int], raw: Optional[str]):
+        self.status = status
+        self.seconds = seconds
+        self.raw = raw
+
+    @property
+    def minutes(self) -> Optional[int]:
+        return None if self.seconds is None else self.seconds // 60
+
+    def describe(self) -> str:
+        if self.seconds is None:
+            return f"status={self.status or 'unknown'}, time unreadable"
+        h, rem = divmod(self.seconds, 3600)
+        return f"status={self.status or 'unknown'}, logged {h}h {rem // 60}m ({self.raw})"
+
+
+def _parse_timer_spans(page: Page) -> tuple[Optional[int], Optional[str]]:
+    """
+    Read #totalInTime's spans into (seconds, "HH:MM:SS").
+
+    The widget renders the running total as one span per unit. Older tenants
+    render a single text node instead, so a plain HH:MM(:SS) string is accepted
+    as a fallback rather than failing the whole read.
+    """
+    container = page.locator(TOTAL_TIME_SELECTOR).first
+    container.wait_for(state="attached", timeout=10_000)
+
+    spans = container.locator("span")
+    parts = [
+        (spans.nth(index).inner_text() or "").strip()
+        for index in range(spans.count())
+    ]
+    parts = [part for part in parts if re.fullmatch(r"\d{1,3}", part)]
+
+    if not parts:
+        text = (container.inner_text() or "").strip()
+        match = re.match(r"(\d{1,3})\s*[:hH]\s*(\d{1,2})(?:\s*[:mM]\s*(\d{1,2}))?", text)
         if not match:
-            log.warning("Could not parse the time format from '%s'. Skipping 9.5h check.", time_text)
-            return
-            
-        hours = int(match.group(1))
-        minutes = int(match.group(2))
-        total_minutes = (hours * 60) + minutes
-        required_minutes = 9 * 60 + 30  # 9.5 hours = 570 minutes
-        
-        log.info("Current logged time read as: %dh %dm (%d total minutes)", hours, minutes, total_minutes)
-        
-        if total_minutes < required_minutes:
-            raise AutomationError(
-                f"SAFETY ABORT: Attempting to check out too early. "
-                f"Only {hours}h {minutes}m elapsed. 9.5 hours (570m) required."
-            )
-        log.info("Safety check passed: 9.5 hour requirement met.")
-            
-    except PlaywrightTimeoutError:
-        log.warning("Could not locate the total hours element on screen. Skipping 9.5h check.")
+            return None, text or None
+        parts = [g for g in match.groups() if g is not None]
+
+    hours = int(parts[0])
+    minutes = int(parts[1]) if len(parts) > 1 else 0
+    seconds = int(parts[2]) if len(parts) > 2 else 0
+    raw = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return hours * 3600 + minutes * 60 + seconds, raw
+
+
+def read_attendance(page: Page) -> AttendanceSnapshot:
+    """Read the attendance widget. Never raises — an unreadable widget is data."""
+    status: Optional[str] = None
+    try:
+        status_el = page.locator(ATT_STATUS_SELECTOR).first
+        status_el.wait_for(state="attached", timeout=10_000)
+        status = (status_el.inner_text() or "").strip() or None
+    except (PlaywrightError, PlaywrightTimeoutError):
+        log.warning("Could not read %s.", ATT_STATUS_SELECTOR)
+
+    try:
+        seconds, raw = _parse_timer_spans(page)
+    except (PlaywrightError, PlaywrightTimeoutError):
+        log.warning("Could not read %s.", TOTAL_TIME_SELECTOR)
+        seconds, raw = None, None
+
+    snapshot = AttendanceSnapshot(status, seconds, raw)
+    log.info("Attendance widget: %s", snapshot.describe())
+    return snapshot
+
+
+def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
+    """
+    POST the snapshot to the dashboard so the console can show it.
+
+    Best-effort by design: the punch is the job, and a dashboard that is down
+    must not fail a run that already succeeded.
+    """
+    base = (os.getenv("CONTROL_CENTER_URL") or "").rstrip("/")
+    if not base:
+        log.info("CONTROL_CENTER_URL is not set; skipping the attendance report.")
+        return
+
+    body = json.dumps(
+        {
+            "status": snapshot.status,
+            "loggedSeconds": snapshot.seconds,
+            "rawTime": snapshot.raw,
+            "source": source,
+            "runId": os.getenv("DISPATCH_RUN_ID") or None,
+        }
+    ).encode("utf-8")
+
+    request = urllib.request.Request(f"{base}/api/attendance", data=body, method="POST")
+    request.add_header("Content-Type", "application/json")
+    secret = os.getenv("DISPATCH_SECRET")
+    if secret:
+        request.add_header("Authorization", f"Bearer {secret}")
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            log.info("Reported attendance to the dashboard (HTTP %s).", response.status)
+    except Exception as exc:  # noqa: BLE001 - reporting must never fail a run
+        log.warning("Could not report attendance to the dashboard: %s", exc)
+
+
+def verify_checkout_eligibility(page: Page) -> None:
+    """
+    Refuse to check out before 9.5 hours are logged.
+
+    Fails *closed* only on a value we could actually read: an unreadable widget
+    warns and proceeds, because blocking a legitimate check-out over a selector
+    change would strand the operator checked in overnight.
+    """
+    snapshot = read_attendance(page)
+
+    if snapshot.minutes is None:
+        log.warning(
+            "Could not read the logged time from %s; skipping the 9.5h check.",
+            TOTAL_TIME_SELECTOR,
+        )
+        return
+
+    total_minutes = snapshot.minutes
+    hours, minutes = divmod(total_minutes, 60)
+    log.info("Current logged time read as: %dh %dm (%d total minutes)", hours, minutes, total_minutes)
+
+    if total_minutes < REQUIRED_MINUTES:
+        raise AutomationError(
+            f"SAFETY ABORT: Attempting to check out too early. "
+            f"Only {hours}h {minutes}m elapsed. 9.5 hours ({REQUIRED_MINUTES}m) required."
+        )
+    log.info("Safety check passed: 9.5 hour requirement met.")
+
+
+def run_status_check(page: Page) -> None:
+    """Read the widget and report it. Nothing is punched."""
+    log.info("STATUS_CHECK: reading the attendance widget...")
+    snapshot = read_attendance(page)
+    report_attendance(snapshot, source="STATUS_CHECK")
+
+    if snapshot.seconds is None:
+        # Loud, but not a failure: the dashboard now shows "unreadable" rather
+        # than a stale number pretending to be current.
+        log.warning("The widget was on screen but could not be parsed.")
+        try:
+            page.screenshot(path="failure.png", full_page=True)
+            log.info("Saved failure.png for the unparsed widget.")
+        except PlaywrightError:
+            pass
+
 
 def punch_attendance(page: Page) -> None:
     """Determine and execute the check-in or check-out action based on dashboard input or UTC time."""
@@ -854,7 +983,15 @@ def punch_attendance(page: Page) -> None:
         page.wait_for_timeout(5_000)
         page.screenshot(path="success.png", full_page=True)
         log.info("Saved success.png")
-        send_telegram_msg(f"✅ Successfully clicked {target_text} at {datetime.now(timezone.utc).strftime('%H:%M')} UTC.")
+
+        # The widget has just been updated by the punch, so this is the freshest
+        # reading there is — the console shows it without a separate check.
+        report_attendance(read_attendance(page), source=dashboard_action or "PUNCH")
+
+        send_telegram_msg(
+            f"✅ Successfully clicked {target_text} at "
+            f"{_ist_now().strftime('%H:%M')} IST."
+        )
     except PlaywrightTimeoutError:
         log.error("Could not find the '%s' button. You may already be punched in/out.", target_text)
         page.screenshot(path="failure.png")
@@ -993,17 +1130,27 @@ def send_telegram_msg(text: str) -> None:
 
 def run() -> None:
     """Drive one full automation run."""
-    # Order matters: ask whether today is a running day *before* sleeping out
-    # the jitter, or a holiday costs 25 minutes of runner time to discover.
-    check_dashboard_policy()
-    randomize_start()
-    
+    # A status check is a read: no holiday policy applies to looking at a page,
+    # and jitter exists to hide *punch* times, so neither gate is relevant. The
+    # operator is waiting on this one, so it starts immediately.
+    status_check = os.getenv("DISPATCH_MODE", "PUNCH").upper() == "STATUS_CHECK"
+
+    if not status_check:
+        # Order matters: ask whether today is a running day *before* sleeping out
+        # the jitter, or a holiday costs 25 minutes of runner time to discover.
+        check_dashboard_policy()
+        randomize_start()
+
+
     # `or` rather than a getenv default: the workflow sets FORM_URL from an
     # optional dispatch input, which is an empty string on scheduled runs.
     form_url = os.getenv("FORM_URL") or DEFAULT_FORM_URL
     headless = os.getenv("HEADLESS", "true").lower() != "false"
 
-    log.info("=== Automation run starting ===")
+    log.info(
+        "=== Automation run starting (%s) ===",
+        "STATUS_CHECK" if status_check else "PUNCH",
+    )
     started = time.monotonic()
 
     with sync_playwright() as playwright:
@@ -1023,7 +1170,10 @@ def run() -> None:
 
         try:
             sign_in(page, form_url)
-            punch_attendance(page)
+            if status_check:
+                run_status_check(page)
+            else:
+                punch_attendance(page)
         except Exception as exc:
             # A screenshot is the single most useful artifact when CI fails, and
             # every failure mode here is "the page did not look as expected".
