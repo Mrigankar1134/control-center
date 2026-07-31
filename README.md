@@ -83,7 +83,7 @@ Two consequences worth knowing:
 | `DISPATCH_WEBHOOK_SECRET` | Sent as `X-Dispatch-Secret` on webhook calls. |
 | `GITHUB_TOKEN` / `GITHUB_OWNER` / `GITHUB_REPO` | GitHub dispatch driver credentials. |
 | `GITHUB_WORKFLOW_ID` | When set, uses `workflow_dispatch`; otherwise `repository_dispatch`. |
-| `GITHUB_REF` | Ref for `workflow_dispatch` (default `main`). |
+| `GITHUB_REF` | Ref for `workflow_dispatch`. Must name a branch that actually exists — this repo's default is `master`, so `main` would fail with 422. |
 
 With no downstream driver configured, dispatches are still recorded in Neon and reported as `SIMULATED` so the UI is usable before wiring the runner.
 
