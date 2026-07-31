@@ -382,6 +382,38 @@ VERIFY_BUTTON = [
 CAPTCHA_INPUT = ["#captcha", "#bcaptcha", "#verifycaptcha"]
 
 
+# Every interaction with the page is preceded by a pause in this range, so the
+# run does not fire off a burst of instantaneous clicks the way no human can.
+# Randomised rather than fixed: a constant interval is itself a fingerprint.
+ACTION_DELAY_MIN = float(os.getenv("ACTION_DELAY_MIN", "0.8"))
+ACTION_DELAY_MAX = float(os.getenv("ACTION_DELAY_MAX", "2.4"))
+
+
+def human_pause(page: Optional[Page] = None, what: str = "the next action") -> None:
+    """
+    Wait a short random moment before acting on the page.
+
+    Uses page.wait_for_timeout when a page is available so Playwright keeps
+    servicing the browser during the wait (a bare time.sleep blocks the event
+    loop and can leave the page mid-render); falls back to time.sleep otherwise.
+    """
+    low, high = ACTION_DELAY_MIN, ACTION_DELAY_MAX
+    if high < low:
+        low, high = high, low
+    if high <= 0:
+        return
+
+    delay = random.uniform(low, high)
+    log.info("Pausing %.1fs before %s.", delay, what)
+    if page is not None:
+        try:
+            page.wait_for_timeout(delay * 1000)
+            return
+        except PlaywrightError:
+            pass  # page/context already gone - fall through to a plain sleep
+    time.sleep(delay)
+
+
 def _first_visible(page: Page, selectors: list[str], timeout: int = 15_000):
     """
     Return the first selector in `selectors` that becomes visible, or None.
@@ -446,6 +478,7 @@ def _fill_verified(page: Page, locator, value: str, what: str) -> None:
     limps on with an empty field. Reading it back turns that into a hard
     failure. Only lengths are logged - `value` may be the password.
     """
+    human_pause(page, f"entering the {what}")
     locator.click()
     locator.fill(value)
     page.wait_for_timeout(200)
@@ -504,6 +537,7 @@ def fill_otp(page: Page, otp: str) -> None:
         raise AutomationError("The OTP field disappeared before the code was entered.")
 
     log.info("Entering the %d-digit code across %d box(es).", len(otp), len(boxes))
+    human_pause(page, "entering the one-time code")
     boxes[0].focus()
     page.keyboard.type(otp, delay=60)
     page.wait_for_timeout(300)
@@ -605,6 +639,7 @@ def _choose_otp_delivery(page: Page, gmail_address: str, timeout: int = 8_000) -
                 if not option.is_visible():
                     continue
                 log.info("MFA method chooser detected; selecting the Gmail address.")
+                human_pause(page, "picking the delivery address")
                 option.click()
                 # Give Zoho a moment to actually dispatch the mail before the
                 # OTP poll starts looking for it.
@@ -657,6 +692,7 @@ def sign_in(page: Page, form_url: str) -> None:
     zoho_password = os.getenv("ZOHO_PASSWORD")
 
     log.info("Navigating to %s", form_url)
+    human_pause(what="opening the sign-in page")
     page.goto(form_url, wait_until="domcontentloaded", timeout=60_000)
 
     # Harmless when FORM_URL already points at the accounts app; needed when it
@@ -664,12 +700,15 @@ def sign_in(page: Page, form_url: str) -> None:
     sign_in_link = _first_visible(page, ['a:has-text("Sign In")'], timeout=3_000)
     if sign_in_link is not None:
         log.info("Landing page detected; clicking Sign In.")
+        human_pause(page, "clicking Sign In")
         sign_in_link.click()
 
     log.info("Entering email address...")
     email_field = _require_visible(page, EMAIL_INPUT, "email field")
     _fill_verified(page, email_field, zoho_email, "email address")
-    _require_visible(page, NEXT_BUTTON, "Next button").click()
+    next_button = _require_visible(page, NEXT_BUTTON, "Next button")
+    human_pause(page, "clicking Next")
+    next_button.click()
 
     # The password field is already in the DOM (and already reports visible) on
     # the email step, so it must not be touched until the email step is gone -
@@ -687,7 +726,9 @@ def sign_in(page: Page, form_url: str) -> None:
             )
         log.info("Entering password...")
         _fill_verified(page, password_field, zoho_password, "password")
-        _require_visible(page, NEXT_BUTTON, "Sign in button").click()
+        sign_in_button = _require_visible(page, NEXT_BUTTON, "Sign in button")
+        human_pause(page, "clicking Sign in")
+        sign_in_button.click()
         _wait_hidden(page, PASSWORD_INPUT, "password field")
     else:
         log.info("No password field shown; assuming a passwordless/OTP-only login.")
@@ -720,6 +761,7 @@ def sign_in(page: Page, form_url: str) -> None:
         verify_button = _first_visible(page, VERIFY_BUTTON, timeout=3_000)
         if verify_button is not None:
             try:
+                human_pause(page, "clicking Verify")
                 verify_button.click(timeout=10_000)
             except PlaywrightError as exc:
                 # The widget may have submitted itself the moment the last
@@ -978,6 +1020,7 @@ def punch_attendance(page: Page) -> None:
     try:
         button = page.locator(f"text='{target_text}'").first
         button.wait_for(state="visible", timeout=15_000)
+        human_pause(page, f"clicking {target_text}")
         button.click()
         log.info("Successfully clicked %s!", target_text)
         page.wait_for_timeout(5_000)
