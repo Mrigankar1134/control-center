@@ -846,10 +846,19 @@ REQUIRED_MINUTES = 9 * 60 + 30
 class AttendanceSnapshot:
     """What the attendance widget showed at one moment."""
 
-    def __init__(self, status: Optional[str], seconds: Optional[int], raw: Optional[str]):
+    def __init__(
+        self,
+        status: Optional[str],
+        seconds: Optional[int],
+        raw: Optional[str],
+        settled: bool = True,
+    ):
         self.status = status
         self.seconds = seconds
         self.raw = raw
+        # False when the widget never filled in and we gave up waiting, so a
+        # zero here means "we could not read it", not "no time is logged".
+        self.settled = settled
 
     @property
     def minutes(self) -> Optional[int]:
@@ -942,6 +951,11 @@ def read_attendance(page: Page) -> AttendanceSnapshot:
                 snapshot.describe(),
                 WIDGET_SETTLE_TIMEOUT,
             )
+            # A status without a time still means the widget loaded - the
+            # timer really is at zero. Only a widget showing *nothing* (no
+            # status, no time) counts as never having loaded, which is the
+            # narrow case callers are allowed to treat as "unknown".
+            snapshot.settled = bool(snapshot.status) or bool(snapshot.seconds)
             break
         page.wait_for_timeout(1_000)
         snapshot = _read_attendance_once(page)
@@ -1015,6 +1029,25 @@ def verify_checkout_eligibility(page: Page) -> None:
         )
         return
 
+    # A zero from a widget that never loaded at all is a *failed read*, not a
+    # real zero, and takes the same fail-open path as the unreadable case above
+    # - otherwise a selector drift silently strands the operator checked in
+    # overnight, which is the failure this function exists to avoid. A loaded
+    # widget reading zero is not covered by this: the timer ticks, so it cannot
+    # stay at exactly zero across the settle window unless it is not running.
+    if not snapshot.settled and snapshot.minutes == 0:
+        log.warning(
+            "The widget never loaded a time (still %s after %ds); checking out "
+            "without the 9.5h check.",
+            snapshot.raw or "blank",
+            WIDGET_SETTLE_TIMEOUT,
+        )
+        send_telegram_msg(
+            "⚠️ Checking out without the 9.5h verification - Zoho's timer never "
+            "loaded. Confirm the hours in Zoho."
+        )
+        return
+
     total_minutes = snapshot.minutes
     hours, minutes = divmod(total_minutes, 60)
     log.info("Current logged time read as: %dh %dm (%d total minutes)", hours, minutes, total_minutes)
@@ -1044,6 +1077,56 @@ def run_status_check(page: Page) -> None:
             pass
 
 
+def _punch_button(page: Page, target_text: str):
+    """
+    Locate the check-in/check-out button.
+
+    Role first: a bare text= selector matches *any* element carrying the words,
+    and My Space is full of them (menu entries, feed items), so it can bind to
+    something that is not the button at all - and clicking it looks exactly
+    like success. The text= form stays as a fallback for tenants that render
+    the control as a div rather than a button.
+    """
+    by_role = page.get_by_role("button", name=target_text, exact=True).first
+    try:
+        by_role.wait_for(state="visible", timeout=8_000)
+        return by_role
+    except (PlaywrightError, PlaywrightTimeoutError):
+        log.info("No button role matched %r; falling back to a text match.", target_text)
+
+    fallback = page.locator(f"text='{target_text}'").first
+    fallback.wait_for(state="visible", timeout=10_000)
+    return fallback
+
+
+def _confirm_punch(page: Page, target_text: str, timeout: int = 20_000) -> None:
+    """
+    Verify Zoho registered the punch, instead of trusting that click() returned.
+
+    A click that lands on the wrong element returns perfectly happily, so the
+    old "Successfully clicked" log (and the Telegram tick behind it) could fire
+    on a run that punched nothing at all. The check is direction-agnostic: the
+    button we just pressed must stop being on screen, because Zoho replaces it
+    with the opposite action. Waiting for that opposite label instead would
+    assume which one comes back, which differs between check-in and check-out.
+    """
+    deadline = time.monotonic() + timeout / 1000
+    selector = f"text='{target_text}'"
+
+    while time.monotonic() < deadline:
+        if _first_visible(page, [selector], timeout=0) is None:
+            log.info("Confirmed: the %s button is gone, so the punch went through.", target_text)
+            return
+        page.wait_for_timeout(500)
+
+    page.screenshot(path="failure.png", full_page=True)
+    raise AutomationError(
+        f"The {target_text} button was clicked but was still on screen "
+        f"{timeout // 1000}s later, so Zoho did not register the punch. See "
+        "failure.png."
+    )
+
+
 def punch_attendance(page: Page) -> None:
     """Determine and execute the check-in or check-out action based on dashboard input or UTC time."""
     log.info("Determining attendance action...")
@@ -1067,27 +1150,34 @@ def punch_attendance(page: Page) -> None:
     # ------------------------
     
     try:
-        button = page.locator(f"text='{target_text}'").first
-        button.wait_for(state="visible", timeout=15_000)
+        button = _punch_button(page, target_text)
         human_pause(page, f"clicking {target_text}")
         button.click()
-        log.info("Successfully clicked %s!", target_text)
-        page.wait_for_timeout(5_000)
-        page.screenshot(path="success.png", full_page=True)
-        log.info("Saved success.png")
-
-        # The widget has just been updated by the punch, so this is the freshest
-        # reading there is — the console shows it without a separate check.
-        report_attendance(read_attendance(page), source=dashboard_action or "PUNCH")
-
-        send_telegram_msg(
-            f"✅ Successfully clicked {target_text} at "
-            f"{_ist_now().strftime('%H:%M')} IST."
+        log.info("Clicked %s; waiting for Zoho to register it...", target_text)
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        log.error(
+            "Could not find or click the '%s' button (%s). You may already be "
+            "punched in/out.",
+            target_text,
+            exc,
         )
-    except PlaywrightTimeoutError:
-        log.error("Could not find the '%s' button. You may already be punched in/out.", target_text)
-        page.screenshot(path="failure.png")
-        raise AutomationError(f"Failed to find or click the {target_text} button.")
+        page.screenshot(path="failure.png", full_page=True)
+        raise AutomationError(f"Failed to find or click the {target_text} button.") from exc
+
+    # Nothing below is announced as success until this returns.
+    _confirm_punch(page, target_text)
+
+    page.wait_for_timeout(2_000)
+    page.screenshot(path="success.png", full_page=True)
+    log.info("Saved success.png")
+
+    # The widget has just been updated by the punch, so this is the freshest
+    # reading there is — the console shows it without a separate check.
+    report_attendance(read_attendance(page), source=dashboard_action or "PUNCH")
+
+    send_telegram_msg(
+        f"✅ {target_text} confirmed at {_ist_now().strftime('%H:%M')} IST."
+    )
 
 
 # The dashboard's Neon database is the single source of truth for *when* the
@@ -1289,12 +1379,30 @@ def run() -> None:
 
 
 
+def _notify_failure(detail: str) -> None:
+    """
+    Push the failure, not just log it.
+
+    Success and stand-down days were already announced, so silence read as
+    "all fine" when it actually meant the punch never happened - the one
+    outcome that needs a human the same evening, and the one nothing reported.
+    """
+    mode = os.getenv("DISPATCH_MODE") or "PUNCH"
+    action = os.getenv("DISPATCH_ACTION") or "auto"
+    send_telegram_msg(
+        f"❌ Bot run FAILED at {_ist_now().strftime('%H:%M')} IST "
+        f"({mode}/{action}): {detail[:300]}"
+    )
+
+
 if __name__ == "__main__":
     try:
         run()
     except AutomationError as exc:
         log.error("Run failed: %s", exc)
+        _notify_failure(str(exc))
         sys.exit(1)
-    except Exception:  # noqa: BLE001 - want the traceback in CI logs
+    except Exception as exc:  # noqa: BLE001 - want the traceback in CI logs
         log.exception("Unexpected error.")
+        _notify_failure(f"{type(exc).__name__}: {exc}")
         sys.exit(1)
