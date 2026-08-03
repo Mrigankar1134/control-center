@@ -158,6 +158,17 @@ Intent comes from the dispatched action, or on a cron run from the **time of day
 
 `classify_status()` matches on word boundaries in a fixed order rather than testing substrings. This matters: **`"Yet to Check-in"` contains `"in"` and no `"out"`**, so the previous substring test read *not checked in* as *checked in* and would have aimed a morning cron at Check-out. Cron runs pass no `DISPATCH_ACTION`, so that was the live path. The 9.5 h guard would have caught it, but as a hard failure rather than a punch.
 
+### The MFA interstitial
+
+After OTP verification Zoho sometimes serves a full page — not a modal — titled *"Re-enable MFA for better security"*, sitting between sign-in and the dashboard. It is handled by `defer_mfa_prompt()`, which clicks **"Remind in 2 weeks"** and nothing else.
+
+That page carries **"Enable MFA"**, **"Verify"**, **"Change Configuration"** and **"Delete Configuration"** — every one of which mutates account security, and enabling MFA would lock the bot out permanently. So the handling is deliberately narrow: it clicks only when a recognised defer control is present, re-checks the resolved label against a denylist immediately before clicking, and if no defer control is reachable it **fails with an explanation rather than pressing something else**.
+
+Two related traps this closes:
+
+- The page is served on an `accounts.zoho.*` URL that can itself satisfy `SIGNED_IN_URL_PATTERN`, so reaching a "signed in" URL is not proof of reaching the dashboard. `_settle_after_signin()` requires the prompt to be gone as well.
+- The page has its own **"Verify"** button, which matched the OTP flow's verify selector. If Zoho auto-submitted the OTP, the bot could have clicked it and started re-verifying MFA. The verify click is now gated on the OTP field still being on screen.
+
 ### Two guards that fail closed
 
 - **The 9.5 h check-out guard refuses to guess.** If neither the API payload nor the widget yields an elapsed time, the bot **aborts instead of checking out**. It used to warn and proceed, which is how a 2 h 27 m day got punched out at 12:31 on 3 Aug 2026. An unverified check-out is a payroll problem; a missed one is a two-second manual fix. `ALLOW_UNVERIFIED_CHECKOUT=true` overrides it if you ever need to.

@@ -363,8 +363,112 @@ MODAL_DISMISS_BUTTONS = [
     "#closePopup",
 ]
 
-# Never click these even if the text matches - they log us out or navigate away.
-MODAL_CLICK_DENYLIST = re.compile(r"sign\s*out|log\s*out|delete|cancel\s+check", re.I)
+# Never click these even if the text matches - they log us out, navigate away,
+# or change account security settings.
+MODAL_CLICK_DENYLIST = re.compile(
+    r"sign\s*out|log\s*out|delete|cancel\s+check|"
+    r"enable\s+mfa|change\s+configuration|security\s+key|authenticator",
+    re.I,
+)
+
+# ---------------------------------------------------------------------------
+# Zoho accounts interstitial: "Re-enable MFA for better security"
+# ---------------------------------------------------------------------------
+#
+# A full page (not a modal) served on accounts.zoho.* after OTP verification,
+# before the dashboard. It offers "Enable MFA", "Verify", "Change Configuration"
+# and "Delete Configuration" - every one of which mutates account security - and
+# a "Remind in 2 weeks" link, which is the only safe way past it.
+#
+# Deferring is a real state change on the account, so it is deliberately narrow:
+# we click nothing unless a recognised defer control is on screen, and the
+# denylist is checked on the resolved label before every click.
+
+MFA_PROMPT_MARKERS = [
+    ':text("Re-enable MFA")',
+    ':text("Enable MFA for better security")',
+    ':text("You\'ve previously configured MFA")',
+]
+MFA_DEFER_CONTROLS = [
+    'a:has-text("Remind in 2 weeks")',
+    'button:has-text("Remind in 2 weeks")',
+    ':text("Remind in 2 weeks")',
+    ':text("Remind me in 2 weeks")',
+    ':text("Remind me later")',
+    ':text("Skip for now")',
+    ':text("Do this later")',
+]
+# Belt and braces: even if a defer selector somehow resolves to one of these,
+# refuse. Enabling MFA would lock the bot out of the account permanently.
+MFA_NEVER_CLICK = re.compile(
+    r"enable\s+mfa|verify|delete\s+configuration|change\s+configuration|"
+    r"security\s+key|oneauth",
+    re.I,
+)
+
+
+def mfa_prompt_visible(page: Page) -> bool:
+    return _first_visible(page, MFA_PROMPT_MARKERS + MFA_DEFER_CONTROLS, timeout=0) is not None
+
+
+def defer_mfa_prompt(page: Page) -> bool:
+    """Click 'Remind in 2 weeks' on the MFA nag. Returns True if we clicked."""
+    control = _first_visible(page, MFA_DEFER_CONTROLS, timeout=0)
+    if control is None:
+        return False
+
+    try:
+        label = (control.inner_text() or "").strip()
+    except PlaywrightError:
+        return False
+
+    if MFA_NEVER_CLICK.search(label):
+        log.error("Refusing to click %r on the MFA page - it would alter account security.", label[:60])
+        return False
+
+    try:
+        human_pause(page, "deferring the MFA prompt")
+        control.click(timeout=5_000)
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        log.warning("Could not defer the MFA prompt: %s", exc)
+        return False
+
+    log.info("Deferred Zoho's MFA prompt via %r.", label[:40])
+    page.wait_for_timeout(1_500)
+    return True
+
+
+def _settle_after_signin(page: Page, timeout: int = 90_000) -> None:
+    """
+    Wait for the dashboard, stepping past interstitials that sit in front of it.
+
+    The MFA page is served on an accounts.zoho URL that can itself satisfy
+    SIGNED_IN_URL_PATTERN, so reaching a "signed in" URL is not sufficient -
+    the prompt has to be gone as well.
+    """
+    deadline = time.monotonic() + timeout / 1000
+    deferred = 0
+
+    while time.monotonic() < deadline:
+        if mfa_prompt_visible(page):
+            if defer_mfa_prompt(page):
+                deferred += 1
+                if deferred > 3:
+                    raise AutomationError(
+                        "Zoho kept showing the MFA prompt after 3 deferrals."
+                    )
+                continue
+            raise AutomationError(
+                "Zoho is asking to re-enable MFA and no 'Remind in 2 weeks' "
+                "control was clickable. Complete or dismiss it manually once."
+            )
+
+        if SIGNED_IN_URL_PATTERN.search(page.url):
+            return
+
+        page.wait_for_timeout(500)
+
+    raise AutomationError(f"Sign-in did not settle on a dashboard; stuck at {page.url}.")
 
 
 def _safe_click(locator, what: str) -> bool:
@@ -737,6 +841,10 @@ def dashboard_url_for(form_url: str) -> str:
 def _looks_signed_in(page: Page) -> bool:
     if not SIGNED_IN_URL_PATTERN.search(page.url):
         return False
+    # The MFA interstitial lives on an accounts.zoho URL that can match the
+    # pattern, so a matching URL alone does not mean we reached the dashboard.
+    if mfa_prompt_visible(page):
+        return False
     # A stale cookie often still lands on a people.zoho URL that then bounces to
     # the sign-in form, so confirm no credential field is on screen.
     return _first_visible(page, EMAIL_INPUT + PASSWORD_INPUT, timeout=0) is None
@@ -756,6 +864,12 @@ def ensure_signed_in(page: Page, form_url: str, state_path: Optional[str]) -> bo
             page.wait_for_timeout(2_500)
         except (PlaywrightError, PlaywrightTimeoutError) as exc:
             raise TransientError(f"Could not reach the dashboard: {exc}") from exc
+
+        # Zoho can serve the MFA nag on a reused session too.
+        if mfa_prompt_visible(page):
+            log.info("MFA prompt served on a reused session; deferring it.")
+            defer_mfa_prompt(page)
+            page.wait_for_timeout(2_000)
 
         if _looks_signed_in(page):
             log.info("Stored session accepted - skipping password and OTP entirely.")
@@ -820,23 +934,31 @@ def sign_in(page: Page, form_url: str) -> None:
         )
         fill_otp(page, otp)
 
-        verify_button = _first_visible(page, VERIFY_BUTTON, timeout=3_000)
-        if verify_button is not None:
-            try:
-                human_pause(page, "clicking Verify")
-                verify_button.click(timeout=10_000)
-            except PlaywrightError:
-                pass
+        # Only look for Verify while the OTP field is still on screen. Zoho's
+        # MFA interstitial also carries a "Verify" button, and if the OTP
+        # auto-submitted we would otherwise click it and start re-verifying MFA.
+        if _first_visible(page, OTP_INPUT, timeout=0) is not None:
+            verify_button = _first_visible(page, VERIFY_BUTTON, timeout=3_000)
+            if verify_button is not None:
+                try:
+                    human_pause(page, "clicking Verify")
+                    verify_button.click(timeout=10_000)
+                except PlaywrightError:
+                    pass
+        else:
+            log.info("OTP field already gone; Zoho auto-submitted the code.")
 
-        try:
-            page.wait_for_url(SIGNED_IN_URL_PATTERN, timeout=60_000)
-        except PlaywrightTimeoutError as exc:
-            raise AutomationError("Sign-in completion timeout.") from exc
+        _settle_after_signin(page)
 
     try:
         page.wait_for_load_state("domcontentloaded", timeout=30_000)
     except PlaywrightTimeoutError:
         pass
+
+    # The prompt can also appear on a password-only sign-in, where the OTP
+    # branch above never ran.
+    if mfa_prompt_visible(page):
+        _settle_after_signin(page)
 
     if not SIGNED_IN_URL_PATTERN.search(page.url):
         raise AutomationError("Bounced from dashboard.")
