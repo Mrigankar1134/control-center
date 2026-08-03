@@ -48,7 +48,17 @@ function serialize(row: typeof attendanceSnapshots.$inferSelect): AttendanceSnap
 function authorised(request: Request): boolean {
   const secret = process.env.DISPATCH_SECRET;
   if (!secret) return true;
-  return request.headers.get("authorization") === `Bearer ${secret}`;
+
+  // Accept either header, matching POST /api/dispatch. `Authorization` is the
+  // obvious choice but CDNs in front of this app can strip it before it reaches
+  // the runtime, which is indistinguishable from a wrong secret at this layer;
+  // `x-dispatch-secret` is a custom name nothing has a reason to touch.
+  const presented =
+    request.headers.get("x-dispatch-secret") ??
+    request.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ??
+    "";
+
+  return presented === secret;
 }
 
 /** GET /api/attendance — the most recent snapshot, or null if none exists. */

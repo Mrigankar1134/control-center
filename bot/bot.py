@@ -1375,7 +1375,9 @@ def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
     request.add_header("Content-Type", "application/json")
     secret = os.getenv("DISPATCH_SECRET")
     if secret:
+        # Both headers: some CDNs strip Authorization before it reaches the app.
         request.add_header("Authorization", f"Bearer {secret}")
+        request.add_header("X-Dispatch-Secret", secret)
 
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
