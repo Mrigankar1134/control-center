@@ -106,6 +106,10 @@ export async function dispatchRun(
   }
 
   revalidatePath("/dashboard");
+  // The console actually lives at "/" (app/page.tsx); there is no /dashboard
+  // route, so the call above alone would be a no-op and the log list would
+  // stay stale until the next 8s poll.
+  revalidatePath("/");
 
   return {
     ok: true,

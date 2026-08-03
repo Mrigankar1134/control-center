@@ -28,6 +28,10 @@ frontend:
         # ungated — set it before exposing this deployment to anyone.
         - echo "DISPATCH_SECRET=$DISPATCH_SECRET" >> .env.production
         - echo "DISPATCH_PIN=$DISPATCH_PIN" >> .env.production
+        # SHA-256 digest of the PIN, used by the dispatchRun server action.
+        # Without this line the console variable never reaches the SSR runtime
+        # and every manual dispatch is refused with "not configured".
+        - echo "DASHBOARD_PIN_HASH=$DASHBOARD_PIN_HASH" >> .env.production
         # --- Downstream driver: GitHub Actions ---
         # GITHUB_* is NOT a reserved prefix in Amplify (unlike AWS_*), so these
         # can be set with their real names in the console.
