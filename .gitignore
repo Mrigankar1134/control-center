@@ -30,6 +30,9 @@ venv/
 # *.png would also swallow public/icons/, and the PWA needs those committed.
 /failure.png
 /*.png
+/trace.zip
+# Saved Zoho session cookies - login-equivalent, never commit these.
+/state/
 playwright-report/
 test-results/
 !public/**/*.png

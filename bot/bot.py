@@ -2,7 +2,7 @@
 Automation bot: signs in to Zoho People with Playwright, retrieving the
 one-time passcode (OTP) from a Gmail inbox over IMAP when Zoho asks for one.
 
-Auth model: Gmail address + 16-character **app password**. App passwords require
+Auth model: Gmail address + 16-character app password. App passwords require
 2-Step Verification on the Google account and are generated at
 https://myaccount.google.com/apppasswords - your normal Google password will not
 work over IMAP. IMAP must also be enabled in Gmail settings
@@ -21,7 +21,16 @@ Optional:
     FORM_URL       Sign-in URL (default: Zoho accounts sign-in for Zoho People)
     HEADLESS       "false" to watch the browser locally (default: headless)
     OTP_TIMEOUT    Seconds to wait for the OTP mail to arrive (default: 120)
-    OTP_SENDER     Only accept mail from this address (default: "zoho.com")
+    OTP_SENDER     Only accept mail from this address (default: "zohoaccounts")
+    STEALTH        "false" to disable playwright-stealth masking (default: on)
+    TRACE          "off" to disable Playwright tracing, "failure" to keep the
+                   trace only when the run fails (default: "on" in CI, "off"
+                   locally). Written to trace.zip; open with
+                   `playwright show-trace trace.zip`.
+    PROXY_SERVER   e.g. "http://residential.example.com:8000" - routes all
+                   browser traffic through a proxy. Optional credentials:
+    PROXY_USERNAME / PROXY_PASSWORD
+    PROXY_BYPASS   Comma-separated hosts to exclude from the proxy
 """
 
 from __future__ import annotations
@@ -30,11 +39,13 @@ import email
 import imaplib
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,6 +53,7 @@ from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -69,33 +81,51 @@ log = logging.getLogger("bot")
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 
-# Env vars that must both be present for the OTP half of the run to be attempted.
 MAIL_ENV_VARS = ("GMAIL_ADDRESS", "GMAIL_APP_PASSWORD")
-
-# IMAP FROM matches on a substring. "zohoaccounts" rather than "zoho.com",
-# which matches nothing at all - the sender is noreply@zohoaccounts.in, and
-# "zoho.com" is not a substring of that. This covers every data centre's
-# sender (.in, .com, .eu) without pinning one address.
 DEFAULT_OTP_SENDER = "zohoaccounts"
-
-# Zoho's sign-in codes are 7 digits, verified against a real mail. The range is
-# kept loose in case that changes.
 OTP_PATTERN = re.compile(r"\b(\d{6,8})\b")
-
-# Zoho's footer is full of digit runs that OTP_PATTERN happily matches: the
-# Chennai postal code 603202, the phone 67447070, the fax 67447172. The body is
-# cut at the first of these markers before searching, otherwise the postal code
-# wins - it is the only such run a \d{6} pattern can match, which is exactly
-# how a 7-digit OTP got silently replaced by a PIN code.
 OTP_FOOTER_MARKER = re.compile(r"Regards,|Zoho Corporation|didn.?t initiate", re.I)
-
-# Allowance for clock skew between Zoho's mail servers and this machine when
-# deciding whether a message is newer than the moment the code was requested.
 OTP_CLOCK_SKEW = timedelta(seconds=60)
 
 
 class AutomationError(RuntimeError):
-    """Raised for any unrecoverable failure in the automation run."""
+    """A logical failure. Retrying will not help - do not retry at the job level."""
+
+
+class TransientError(AutomationError):
+    """
+    Infrastructure flake (DNS, proxy, runner network, mail delivery lag).
+
+    Exits with EXIT_TRANSIENT so the workflow can retry the whole job. Never
+    raised for a decision the bot made on purpose - a 9.5h safety abort or a
+    bad credential must stay a hard failure, or a retry loop would grind
+    against Zoho's abuse filters.
+    """
+
+
+EXIT_OK = 0
+EXIT_PERMANENT = 1
+EXIT_TRANSIENT = 75  # EX_TEMPFAIL; the workflow retries only on this code
+
+# Playwright/OS errors that mean "the network moved", not "the page changed".
+TRANSIENT_MARKERS = re.compile(
+    r"net::ERR_|ERR_PROXY|ERR_TUNNEL|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|"
+    r"ERR_TIMED_OUT|ERR_INTERNET_DISCONNECTED|ECONNRESET|ECONNREFUSED|ETIMEDOUT|"
+    r"Temporary failure in name resolution|getaddrinfo|Connection reset|"
+    r"socket hang up|browser has been closed",
+    re.I,
+)
+
+
+def classify_exit_code(exc: BaseException) -> int:
+    """Decide whether the job is worth retrying."""
+    if isinstance(exc, TransientError):
+        return EXIT_TRANSIENT
+    if isinstance(exc, AutomationError):
+        return EXIT_PERMANENT  # explicit logical failure; a retry repeats it
+    if TRANSIENT_MARKERS.search(str(exc)):
+        return EXIT_TRANSIENT
+    return EXIT_PERMANENT
 
 
 def require_env(*names: str) -> dict[str, str]:
@@ -122,24 +152,20 @@ _HTML_TAGS = re.compile(r"<[^>]+>")
 
 
 def _decode_part(part: Message) -> str:
-    """Decode one MIME part to text, tolerating a wrong or missing charset."""
     payload = part.get_payload(decode=True)
     if not payload:
         return ""
     charset = part.get_content_charset() or "utf-8"
-    # errors="replace": a mojibake byte must not crash the run when the digits
-    # we actually need are almost certainly plain ASCII.
     try:
         return payload.decode(charset, errors="replace")
-    except LookupError:  # charset name the codec registry does not know
+    except LookupError:
         return payload.decode("utf-8", errors="replace")
 
 
 def _message_text(msg: Message) -> str:
-    """Flatten a message to searchable text: subject + plain body (HTML fallback)."""
     try:
         subject = str(make_header(decode_header(msg.get("Subject", ""))))
-    except Exception:  # noqa: BLE001 - malformed headers must not abort the run
+    except Exception:
         subject = msg.get("Subject", "") or ""
 
     plain, html = "", ""
@@ -158,16 +184,12 @@ def _message_text(msg: Message) -> str:
         else:
             plain = _decode_part(msg)
 
-    # Many OTP mails are HTML-only, so falling back to a de-tagged body matters.
     body = plain or _HTML_TAGS.sub(" ", html)
     return f"{subject}\n{body}"
 
 
 def _connect_imap() -> imaplib.IMAP4_SSL:
-    """Log in to Gmail over IMAP and select the inbox."""
     env = require_env(*MAIL_ENV_VARS)
-    # Google shows app passwords as "abcd efgh ijkl mnop"; IMAP wants them
-    # without spaces, and pasting them verbatim is the usual first mistake.
     password = env["GMAIL_APP_PASSWORD"].replace(" ", "")
 
     log.info("Connecting to %s as %s...", IMAP_HOST, env["GMAIL_ADDRESS"])
@@ -176,26 +198,15 @@ def _connect_imap() -> imaplib.IMAP4_SSL:
         mail.login(env["GMAIL_ADDRESS"], password)
     except imaplib.IMAP4.error as exc:
         raise AutomationError(
-            f"IMAP login failed: {exc}. Check that 2-Step Verification is on, that "
-            "GMAIL_APP_PASSWORD is a 16-character app password (not your Google "
-            "password), and that IMAP is enabled in Gmail settings."
+            f"IMAP login failed: {exc}. Check 2-Step Verification and App Password."
         ) from exc
 
-    # readonly: the bot only ever reads. Belt and braces with BODY.PEEK - the
-    # server will not let us change a flag even by accident.
     mail.select("inbox", readonly=True)
     log.info("IMAP login OK; inbox selected (read-only).")
     return mail
 
 
 def extract_otp(text: str) -> Optional[str]:
-    """
-    Pull the sign-in code out of a flattened Zoho mail, or return None.
-
-    The footer is discarded first: it carries a postal code, a phone number
-    and a fax number, all of which look exactly like a code to a bare
-    digit-run pattern.
-    """
     footer = OTP_FOOTER_MARKER.search(text)
     body = text[: footer.start()] if footer else text
     match = OTP_PATTERN.search(body)
@@ -203,7 +214,6 @@ def extract_otp(text: str) -> Optional[str]:
 
 
 def _sent_at(msg: Message) -> Optional[datetime]:
-    """Parse a message's Date header into an aware datetime, or None."""
     raw = msg.get("Date")
     if not raw:
         return None
@@ -211,8 +221,6 @@ def _sent_at(msg: Message) -> Optional[datetime]:
         sent = parsedate_to_datetime(raw)
     except (TypeError, ValueError):
         return None
-    # A Date header with no zone parses as naive; assume UTC so the comparison
-    # in _search_for_otp never raises.
     return sent if sent.tzinfo else sent.replace(tzinfo=timezone.utc)
 
 
@@ -221,27 +229,11 @@ def _search_for_otp(
     sender: Optional[str],
     min_date: Optional[datetime] = None,
 ) -> Optional[str]:
-    """
-    Return an OTP from the newest matching message, or None.
-
-    Freshness is decided purely by min_date - the moment the code was
-    requested. An earlier version also required UNSEEN, which made the run
-    depend on nobody glancing at the inbox: a phone that shows a notification
-    marks the mail read, and the bot would then never see the code it was
-    waiting for. Reading the flag is not a reliable signal for something the
-    account owner also uses, so the fetch uses BODY.PEEK and leaves the
-    mailbox exactly as it found it.
-    """
-    # NOOP asks the server for mailbox updates; without it, mail that arrived
-    # after SELECT may not show up in a repeated SEARCH.
     mail.noop()
-
     criteria: list[str] = []
     if sender:
         criteria += ["FROM", f'"{sender}"']
     if min_date:
-        # IMAP SINCE is date-granular and server-timezone-ish, so subtract a day
-        # and let the Date-header check below do the precise filtering.
         since = (min_date - timedelta(days=1)).strftime("%d-%b-%Y")
         criteria += ["SINCE", since]
 
@@ -249,10 +241,7 @@ def _search_for_otp(
     if status != "OK":
         raise AutomationError(f"IMAP search failed with status {status}.")
 
-    # Newest last in IMAP's ID order, so walk backwards to prefer the latest code.
     for message_id in reversed(messages[0].split()):
-        # PEEK, not RFC822: fetching with RFC822 would mark the user's mail
-        # read as a side effect of the bot looking at it.
         status, msg_data = mail.fetch(message_id, "(BODY.PEEK[])")
         if status != "OK":
             continue
@@ -265,18 +254,12 @@ def _search_for_otp(
             if min_date:
                 sent = _sent_at(msg)
                 if sent and sent < min_date:
-                    log.debug(
-                        "Ignoring older message (sent %s, need >= %s).", sent, min_date
-                    )
+                    log.debug("Ignoring older message (sent %s, need >= %s).", sent, min_date)
                     continue
 
             otp = extract_otp(_message_text(msg))
             if otp:
-                log.info(
-                    "OTP found in message from %r (subject: %r)",
-                    msg.get("From"),
-                    msg.get("Subject"),
-                )
+                log.info("OTP found in message from %r", msg.get("From"))
                 return otp
 
     return None
@@ -288,28 +271,14 @@ def fetch_otp_from_gmail(
     sender: Optional[str] = None,
     min_date: Optional[datetime] = None,
 ) -> str:
-    """
-    Poll the Gmail inbox until an OTP arrives, then return it.
-
-    Only mail newer than `min_date` is considered, so a code from an earlier
-    run is never reused. Raises AutomationError if nothing arrives before the
-    timeout.
-    """
     mail: Optional[imaplib.IMAP4_SSL] = None
     deadline = time.monotonic() + timeout
     attempt = 0
     if min_date is None:
         min_date = datetime.now(timezone.utc)
-    # Zoho's mail servers and this machine do not share a clock, so a message
-    # stamped a few seconds "before" the request is still the right one.
     min_date -= OTP_CLOCK_SKEW
 
-    log.info(
-        "Polling Gmail for an OTP from %s sent after %s (timeout: %ss)...",
-        sender or "any sender",
-        min_date.isoformat(timespec="seconds"),
-        timeout,
-    )
+    log.info("Polling Gmail for OTP...")
     try:
         while time.monotonic() < deadline:
             attempt += 1
@@ -320,51 +289,37 @@ def fetch_otp_from_gmail(
                 if otp:
                     return otp
             except imaplib.IMAP4.error as exc:
-                # Gmail drops idle connections; reconnect on the next pass.
-                log.warning("IMAP error on attempt %s: %s. Reconnecting.", attempt, exc)
+                log.warning("IMAP error attempt %s: %s. Reconnecting.", attempt, exc)
                 mail = None
-            except OSError as exc:  # socket/TLS trouble
-                log.warning("Network error on attempt %s: %s. Retrying.", attempt, exc)
+            except OSError as exc:
+                log.warning("Network error attempt %s: %s. Retrying.", attempt, exc)
                 mail = None
 
-            log.info("No OTP yet (attempt %s); waiting %ss.", attempt, poll_interval)
             time.sleep(poll_interval)
     finally:
         if mail is not None:
             try:
                 mail.close()
                 mail.logout()
-            except Exception:  # noqa: BLE001 - never mask the real failure
+            except Exception:
                 pass
 
-    raise AutomationError(f"No OTP received within {timeout}s ({attempt} attempts).")
+    # Mail delivery lag is a flake, not a logic error - worth one job retry.
+    raise TransientError(f"No OTP received within {timeout}s.")
 
 
 # ---------------------------------------------------------------------------
-# Playwright: the Zoho People sign-in & Attendance
+# Playwright: Zoho People Sign-in & Attendance
 # ---------------------------------------------------------------------------
 
-# The marketing page (zoho.com/people/login.html) only hosts a "Sign In" link
-# that bounces here, so going straight to the accounts app skips a redirect and
-# a click. The .in TLD is this org's data centre (confirmed: sign-in lands on
-# people.zoho.in); change it (.com / .eu / .com.au) for another tenant, or
-# override with the FORM_URL env var.
 DEFAULT_FORM_URL = "https://accounts.zoho.in/signin?servicename=zohopeople"
-
-# Landing on any of these means the sign-in completed.
 SIGNED_IN_URL_PATTERN = re.compile(r"people\.zoho\.[a-z.]+|accounts\.zoho\.[a-z.]+/home")
 
-# Zoho renders sign-in as a wizard: each step swaps the fields in place without
-# a navigation, and the exact markup differs between password, passwordless and
-# MFA-enabled accounts. So every step below is a list of candidate locators
-# tried in order - the first one that actually becomes visible wins. Verify
-# these against your own tenant with:
-#     playwright codegen https://accounts.zoho.com/signin?servicename=zohopeople
 EMAIL_INPUT = ["#login_id", 'input[name="LOGIN_ID"]', 'input[type="email"]']
 NEXT_BUTTON = ["#nextbtn", 'button:has-text("Next")', 'button[type="submit"]']
 PASSWORD_INPUT = ["#password", 'input[name="PASSWORD"]', 'input[type="password"]']
 OTP_INPUT = [
-    "input.customOtp",  # Zoho's split one-digit-per-box widget
+    "input.customOtp",
     "input.mfa_email_otp",
     'input[autocomplete="one-time-code"]',
     "#otpcode",
@@ -379,25 +334,105 @@ VERIFY_BUTTON = [
     'button:has-text("Sign in")',
     "#nextbtn",
 ]
-# Present but hidden on a normal sign-in; visible means we are blocked.
 CAPTCHA_INPUT = ["#captcha", "#bcaptcha", "#verifycaptcha"]
 
+# Overlays Zoho People throws up after login: work-policy prompts, product
+# announcements, surveys, feature tours. Ordered most specific first so a
+# "Work from Home"/"At Office" confirmation is answered rather than dismissed.
+WORK_POLICY_BUTTONS = [
+    'button:has-text("At Office")',
+    'button:has-text("Work From Office")',
+    'button:has-text("At office")',
+    '[role="button"]:has-text("At Office")',
+]
+MODAL_DISMISS_BUTTONS = [
+    'button:has-text("Skip")',
+    'button:has-text("Not now")',
+    'button:has-text("Maybe later")',
+    'button:has-text("Remind me later")',
+    'button:has-text("Dismiss")',
+    'button:has-text("Got it")',
+    'button:has-text("Close")',
+    'button:has-text("No thanks")',
+    ".zpeople_popup_close",
+    ".dialog-close",
+    ".modal-header .close",
+    '[aria-label="Close"]',
+    '[data-dismiss="modal"]',
+    ".ui-dialog-titlebar-close",
+    "#closePopup",
+]
 
-# Every interaction with the page is preceded by a pause in this range, so the
-# run does not fire off a burst of instantaneous clicks the way no human can.
-# Randomised rather than fixed: a constant interval is itself a fingerprint.
+# Never click these even if the text matches - they log us out or navigate away.
+MODAL_CLICK_DENYLIST = re.compile(r"sign\s*out|log\s*out|delete|cancel\s+check", re.I)
+
+
+def _safe_click(locator, what: str) -> bool:
+    """Click a modal control without letting a stale/detached node kill the run."""
+    try:
+        if not locator.is_visible():
+            return False
+        label = (locator.inner_text() or locator.get_attribute("aria-label") or "").strip()
+        if label and MODAL_CLICK_DENYLIST.search(label):
+            log.warning("Refusing to click %r (denylisted).", label[:60])
+            return False
+        locator.click(timeout=2_000)
+        log.info("Dismissed overlay via %s%s", what, f" ({label[:40]!r})" if label else "")
+        return True
+    except (PlaywrightError, PlaywrightTimeoutError):
+        return False
+
+
+def dismiss_modals(page: Page, rounds: int = 3) -> int:
+    """
+    Clear blocking overlays before we look for the punch button.
+
+    Each selector is probed with a short timeout, so a page with no modals
+    costs well under a second. Runs a few rounds because Zoho sometimes
+    stacks a survey behind an announcement.
+    """
+    dismissed = 0
+
+    for attempt in range(rounds):
+        clicked = False
+
+        # Work-policy prompt first: it wants an answer, not a close button.
+        for selector in WORK_POLICY_BUTTONS:
+            if _safe_click(page.locator(selector).first, f"work-policy {selector}"):
+                clicked = True
+                dismissed += 1
+                break
+
+        if not clicked:
+            for selector in MODAL_DISMISS_BUTTONS:
+                if _safe_click(page.locator(selector).first, selector):
+                    clicked = True
+                    dismissed += 1
+                    break
+
+        if not clicked:
+            # Last resort: a generic overlay with no recognised control. Escape
+            # closes most Zoho dialogs; harmless if nothing is open.
+            if attempt == 0:
+                try:
+                    page.keyboard.press("Escape")
+                except PlaywrightError:
+                    pass
+            break
+
+        page.wait_for_timeout(600)
+
+    if dismissed:
+        log.info("Dismissed %d overlay(s) before proceeding.", dismissed)
+    else:
+        log.info("No blocking overlays detected.")
+    return dismissed
+
 ACTION_DELAY_MIN = float(os.getenv("ACTION_DELAY_MIN", "0.8"))
 ACTION_DELAY_MAX = float(os.getenv("ACTION_DELAY_MAX", "2.4"))
 
 
 def human_pause(page: Optional[Page] = None, what: str = "the next action") -> None:
-    """
-    Wait a short random moment before acting on the page.
-
-    Uses page.wait_for_timeout when a page is available so Playwright keeps
-    servicing the browser during the wait (a bare time.sleep blocks the event
-    loop and can leave the page mid-render); falls back to time.sleep otherwise.
-    """
     low, high = ACTION_DELAY_MIN, ACTION_DELAY_MAX
     if high < low:
         low, high = high, low
@@ -411,97 +446,58 @@ def human_pause(page: Optional[Page] = None, what: str = "the next action") -> N
             page.wait_for_timeout(delay * 1000)
             return
         except PlaywrightError:
-            pass  # page/context already gone - fall through to a plain sleep
+            pass
     time.sleep(delay)
 
 
 def _first_visible(page: Page, selectors: list[str], timeout: int = 15_000):
-    """
-    Return the first selector in `selectors` that becomes visible, or None.
-
-    Polls all candidates together rather than waiting out the full timeout on
-    each, so a five-candidate list still resolves in about one timeout.
-    """
     deadline = time.monotonic() + timeout / 1000
-    while True:  # always sweep once, so timeout=0 means "check right now"
+    while True:
         for selector in selectors:
             locator = page.locator(selector).first
             try:
                 if locator.is_visible():
                     return locator
             except PlaywrightError:
-                continue  # selector not in the DOM yet
+                continue
         if time.monotonic() >= deadline:
             return None
         page.wait_for_timeout(250)
 
 
 def _require_visible(page: Page, selectors: list[str], what: str, timeout: int = 15_000):
-    """Like _first_visible, but fail loudly with the candidates that were tried."""
     locator = _first_visible(page, selectors, timeout)
     if locator is None:
-        raise AutomationError(
-            f"Could not find the {what} within {timeout // 1000}s. Tried: "
-            + ", ".join(selectors)
-            + ". Re-run `playwright codegen` against your Zoho tenant and update "
-            "the selector list in bot.py; see failure.png for what was on screen."
-        )
+        raise AutomationError(f"Could not find {what} within {timeout // 1000}s.")
     return locator
 
 
 def _wait_hidden(page: Page, selectors: list[str], what: str, timeout: int = 20_000) -> None:
-    """
-    Block until none of `selectors` is visible.
-
-    Zoho's wizard keeps every step's markup in one document and swaps
-    visibility, so the *next* step's fields already report visible (as
-    zero-ish-width slivers) while the current step is still on screen.
-    Waiting for the current step to disappear is what makes "the page has
-    actually advanced" true before we touch anything.
-    """
     deadline = time.monotonic() + timeout / 1000
     while time.monotonic() < deadline:
         if _first_visible(page, selectors, timeout=0) is None:
             return
         page.wait_for_timeout(250)
-    raise AutomationError(
-        f"The {what} was still on screen after {timeout // 1000}s - the previous "
-        "step did not go through. See failure.png."
-    )
+    raise AutomationError(f"{what} remained visible after {timeout // 1000}s.")
 
 
 def _fill_verified(page: Page, locator, value: str, what: str) -> None:
-    """
-    Fill a field and read the value back, retrying with real keystrokes.
-
-    Playwright's fill() sets the value directly; if the element is mid-render
-    or a framework re-binds it, the value silently vanishes and the run
-    limps on with an empty field. Reading it back turns that into a hard
-    failure. Only lengths are logged - `value` may be the password.
-    """
-    human_pause(page, f"entering the {what}")
+    human_pause(page, f"entering {what}")
     locator.click()
     locator.fill(value)
     page.wait_for_timeout(200)
 
     if locator.input_value() != value:
-        log.warning("fill() did not stick for the %s; retrying with keystrokes.", what)
         locator.fill("")
         locator.press_sequentially(value, delay=40)
         page.wait_for_timeout(200)
 
-    actual = locator.input_value()
-    if actual != value:
-        raise AutomationError(
-            f"Could not enter the {what}: the field holds {len(actual)} characters, "
-            f"expected {len(value)}. Zoho most likely re-rendered the step underneath "
-            "the fill. See failure.png."
-        )
-    log.info("Entered the %s (%d characters).", what, len(value))
+    if locator.input_value() != value:
+        raise AutomationError(f"Could not enter {what}.")
+    log.info("Entered %s.", what)
 
 
 def _otp_boxes(page: Page) -> list:
-    """Every visible OTP input, in document order."""
     locator = page.locator(", ".join(OTP_INPUT))
     boxes = []
     for index in range(locator.count()):
@@ -515,7 +511,6 @@ def _otp_boxes(page: Page) -> list:
 
 
 def _read_otp_boxes(page: Page) -> str:
-    """Concatenate what is currently in the OTP boxes."""
     try:
         return "".join(box.input_value() for box in _otp_boxes(page))
     except PlaywrightError:
@@ -523,22 +518,11 @@ def _read_otp_boxes(page: Page) -> str:
 
 
 def fill_otp(page: Page, otp: str) -> None:
-    """
-    Enter the code, coping with Zoho's split one-digit-per-box widget.
-
-    Two things make this different from an ordinary text field. The digit
-    inputs sit inside a <div id="mfa_email" class="textbox"> that swallows
-    pointer events, so clicking the input never lands - focus() sidesteps the
-    hit test entirely. And with one character per box, a single fill() would
-    only ever populate the first digit, so the code is typed as real
-    keystrokes and the widget moves focus along itself.
-    """
     boxes = _otp_boxes(page)
     if not boxes:
-        raise AutomationError("The OTP field disappeared before the code was entered.")
+        raise AutomationError("OTP field missing.")
 
-    log.info("Entering the %d-digit code across %d box(es).", len(otp), len(boxes))
-    human_pause(page, "entering the one-time code")
+    human_pause(page, "entering OTP")
     boxes[0].focus()
     page.keyboard.type(otp, delay=60)
     page.wait_for_timeout(300)
@@ -546,9 +530,6 @@ def fill_otp(page: Page, otp: str) -> None:
     if _read_otp_boxes(page) == otp:
         return
 
-    # Typing can be swallowed if the widget re-renders mid-entry; fall back to
-    # writing the boxes directly.
-    log.warning("Typing the code did not stick; filling the boxes directly.")
     boxes = _otp_boxes(page)
     if len(boxes) == 1:
         boxes[0].fill(otp)
@@ -557,40 +538,16 @@ def fill_otp(page: Page, otp: str) -> None:
             box.fill(digit)
     page.wait_for_timeout(300)
 
-    actual = _read_otp_boxes(page)
-    if actual != otp:
-        raise AutomationError(
-            f"Could not enter the one-time code: {len(boxes)} box(es) hold "
-            f"{len(actual)} of {len(otp)} digits. See failure.png."
-        )
-
 
 def _check_for_captcha(page: Page) -> None:
-    """Fail with a clear message if Zoho puts a CAPTCHA in the way."""
     if _first_visible(page, CAPTCHA_INPUT, timeout=0) is not None:
-        raise AutomationError(
-            "Zoho is showing a CAPTCHA, which this bot cannot solve. It usually "
-            "appears after repeated failed sign-ins or from an unfamiliar IP - "
-            "sign in once by hand to clear it, then re-run."
-        )
+        raise AutomationError("Zoho CAPTCHA encountered.")
 
 
 def _masked_mail_patterns(address: str) -> list[re.Pattern]:
-    """
-    Regexes for how Zoho masks a delivery address on the MFA chooser.
-
-    Zoho shows "mr***********l@gm***.c**" rather than the address itself, and
-    the number of asterisks tracks the length of what is hidden - so matching a
-    literal mask would break for any other account. Anchoring on the two
-    characters Zoho leaves visible either side of the "@" is what survives.
-
-    Strict (whole address) first; the domain-only fallback covers the local
-    part being rendered in a sibling node. The fallback is still specific
-    enough not to match a phone option or a differently-domained address.
-    """
     local, _, domain = address.partition("@")
     if not local or not domain:
-        raise AutomationError(f"GMAIL_ADDRESS is not an email address: {address!r}")
+        raise AutomationError(f"Invalid email: {address!r}")
     head, dom = re.escape(local[:2]), re.escape(domain[:2])
     return [
         re.compile(rf"{head}[\w*.+-]*@{dom}\*+\.", re.I),
@@ -598,39 +555,13 @@ def _masked_mail_patterns(address: str) -> list[re.Pattern]:
     ]
 
 
-def _visible_option_texts(page: Page) -> list[str]:
-    """Text of every visible clickable thing, for diagnosing a missed screen."""
-    try:
-        texts = page.evaluate(
-            """() => Array.from(document.querySelectorAll(
-                   'a,button,li,[role=button],[role=option],[onclick]'))
-                 .filter(el => el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-                 .map(el => (el.innerText || '').trim())
-                 .filter(t => t && t.length < 80)"""
-        )
-    except PlaywrightError:
-        return []
-    return list(dict.fromkeys(texts))[:20]  # de-duplicated, capped
-
-
 def _choose_otp_delivery(page: Page, gmail_address: str, timeout: int = 8_000) -> bool:
-    """
-    Click the Gmail option if Zoho asks *where* to send the code.
-
-    On an unrecognised device (every CI runner, since the IP is new each run)
-    Zoho interposes a method chooser and sends nothing until one is picked.
-    Skipping this screen means waiting out the OTP timeout for a mail that was
-    never dispatched. Returns True if an option was clicked.
-    """
     patterns = _masked_mail_patterns(gmail_address)
     deadline = time.monotonic() + timeout / 1000
 
     while True:
-        # A recognised device goes straight through; don't spend the full
-        # timeout waiting for a chooser that is never coming.
         if SIGNED_IN_URL_PATTERN.search(page.url):
             return False
-        # Skip the chooser if the OTP box is already up - Zoho picked for us.
         if _first_visible(page, OTP_INPUT, timeout=0) is not None:
             return False
 
@@ -639,15 +570,12 @@ def _choose_otp_delivery(page: Page, gmail_address: str, timeout: int = 8_000) -
             try:
                 if not option.is_visible():
                     continue
-                log.info("MFA method chooser detected; selecting the Gmail address.")
-                human_pause(page, "picking the delivery address")
+                human_pause(page, "picking delivery address")
                 option.click()
-                # Give Zoho a moment to actually dispatch the mail before the
-                # OTP poll starts looking for it.
                 page.wait_for_timeout(2_000)
                 return True
             except PlaywrightError:
-                continue  # nothing matching in the DOM yet
+                continue
 
         if time.monotonic() >= deadline:
             return False
@@ -655,15 +583,6 @@ def _choose_otp_delivery(page: Page, gmail_address: str, timeout: int = 8_000) -
 
 
 def _await_otp_or_dashboard(page: Page, timeout: int = 45_000):
-    """
-    Wait for whichever comes first: the OTP prompt, or the signed-in page.
-
-    Zoho asks for a code only sometimes - a recognised device sails straight
-    through - so this races the two outcomes instead of assuming either. It
-    returns the OTP field, or None if the sign-in already completed. A fixed
-    sleep on the OTP field would either miss a slow prompt or waste that wait
-    on every run that does not get one.
-    """
     deadline = time.monotonic() + timeout / 1000
     while True:
         if SIGNED_IN_URL_PATTERN.search(page.url):
@@ -672,84 +591,228 @@ def _await_otp_or_dashboard(page: Page, timeout: int = 45_000):
         if otp_field is not None:
             return otp_field
         if time.monotonic() >= deadline:
-            # List what was actually on screen: the previous version of this
-            # message sent us to failure.png to find out, which needs a human.
-            options = _visible_option_texts(page)
-            raise AutomationError(
-                f"After signing in, neither the OTP prompt nor the dashboard "
-                f"appeared within {timeout // 1000}s; still at {page.url}. "
-                f"Visible options were: {options or 'none found'}. If one of "
-                "those is a verification method, add it to _choose_otp_delivery; "
-                "if an OTP box is visible in failure.png, add its selector to "
-                "OTP_INPUT in bot.py."
-            )
+            raise AutomationError(f"Dashboard/OTP timeout at {page.url}.")
         page.wait_for_timeout(500)
 
 
+# ---------------------------------------------------------------------------
+# Session reuse: skip email/password/OTP when a stored Zoho session is alive
+# ---------------------------------------------------------------------------
+#
+# Zoho sessions typically survive 7-30 days depending on org policy. Reusing one
+# removes the slowest and most fragile leg of the run (IMAP round-trip for the
+# OTP) and stops us hammering Zoho's OTP endpoint twice a day, which is what
+# trips abuse heuristics.
+#
+# SECURITY: the storage state contains live session cookies - anyone holding it
+# is logged in as you, no OTP required. It is therefore encrypted at rest with
+# STATE_KEY (a repo secret) before anything touches the Actions cache, because
+# cache entries on a PUBLIC repo are readable by workflows from forked PRs.
+# Without STATE_KEY we refuse to persist in CI at all. See README.
+
+STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
+STATE_BLOB = STATE_DIR / "zoho_state.enc"       # what CI caches (encrypted)
+STATE_PLAIN = STATE_DIR / "zoho_state.json"     # local-only convenience
+STATE_MAX_AGE_DAYS = float(os.getenv("STATE_MAX_AGE_DAYS", "7"))
+
+
+def _state_cipher():
+    """Fernet instance from STATE_KEY, or None when unset/unavailable."""
+    key = (os.getenv("STATE_KEY") or "").strip()
+    if not key:
+        return None
+    try:
+        from cryptography.fernet import Fernet  # type: ignore
+    except ImportError:
+        log.warning("STATE_KEY set but `cryptography` is not installed.")
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception as exc:
+        log.warning("STATE_KEY is not a valid Fernet key (%s).", exc)
+        return None
+
+
+def session_reuse_enabled() -> bool:
+    if os.getenv("SESSION_REUSE", "true").lower() in ("false", "0", "off"):
+        return False
+    # In CI, refuse to write session cookies anywhere unencrypted.
+    if os.getenv("GITHUB_ACTIONS") == "true" and _state_cipher() is None:
+        log.info("Session reuse disabled in CI: STATE_KEY is not configured.")
+        return False
+    return True
+
+
+def load_storage_state() -> Optional[str]:
+    """
+    Return a path Playwright can pass as `storage_state`, or None.
+
+    Discards state that is unreadable, undecryptable, or older than
+    STATE_MAX_AGE_DAYS - a stale cookie jar just means we sign in normally.
+    """
+    if not session_reuse_enabled():
+        return None
+
+    cipher = _state_cipher()
+    source = STATE_BLOB if STATE_BLOB.exists() else STATE_PLAIN
+    if not source.exists():
+        log.info("No stored session found; signing in from scratch.")
+        return None
+
+    try:
+        payload = source.read_bytes()
+        if source == STATE_BLOB:
+            if cipher is None:
+                log.warning("Found encrypted session but no usable STATE_KEY; ignoring.")
+                return None
+            payload = cipher.decrypt(payload)
+        wrapper = json.loads(payload.decode("utf-8"))
+        saved_at = datetime.fromisoformat(wrapper["savedAt"])
+        state = wrapper["state"]
+    except Exception as exc:
+        log.warning("Stored session unreadable (%s); signing in from scratch.", exc)
+        return None
+
+    age = datetime.now(timezone.utc) - saved_at
+    if age > timedelta(days=STATE_MAX_AGE_DAYS):
+        log.info("Stored session is %.1f days old (max %.1f); discarding.",
+                 age.total_seconds() / 86400, STATE_MAX_AGE_DAYS)
+        return None
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    handoff = STATE_DIR / "_active_state.json"
+    handoff.write_text(json.dumps(state), encoding="utf-8")
+    log.info("Loaded stored session (%.1f hours old).", age.total_seconds() / 3600)
+    return str(handoff)
+
+
+def save_storage_state(context) -> None:
+    if not session_reuse_enabled():
+        return
+
+    try:
+        state = context.storage_state()
+    except Exception as exc:
+        log.warning("Could not export session state: %s", exc)
+        return
+
+    wrapper = json.dumps(
+        {"savedAt": datetime.now(timezone.utc).isoformat(), "state": state}
+    ).encode("utf-8")
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cipher = _state_cipher()
+    try:
+        if cipher is not None:
+            STATE_BLOB.write_bytes(cipher.encrypt(wrapper))
+            # Never leave a plaintext cookie jar behind once we can encrypt.
+            STATE_PLAIN.unlink(missing_ok=True)
+            log.info("Session state saved (encrypted) -> %s", STATE_BLOB)
+        else:
+            STATE_PLAIN.write_bytes(wrapper)
+            log.info("Session state saved (PLAINTEXT, local only) -> %s", STATE_PLAIN)
+    except Exception as exc:
+        log.warning("Could not persist session state: %s", exc)
+    finally:
+        (STATE_DIR / "_active_state.json").unlink(missing_ok=True)
+
+
+def discard_storage_state() -> None:
+    """Drop a session Zoho no longer accepts so the next run does not retry it."""
+    for path in (STATE_BLOB, STATE_PLAIN, STATE_DIR / "_active_state.json"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    log.info("Cleared stored session.")
+
+
+def dashboard_url_for(form_url: str) -> str:
+    """accounts.zoho.in/signin?... -> https://people.zoho.in/ (same data centre)."""
+    host = urllib.parse.urlsplit(form_url).hostname or "accounts.zoho.in"
+    people = re.sub(r"^accounts\.", "people.", host)
+    return f"https://{people}/"
+
+
+def _looks_signed_in(page: Page) -> bool:
+    if not SIGNED_IN_URL_PATTERN.search(page.url):
+        return False
+    # A stale cookie often still lands on a people.zoho URL that then bounces to
+    # the sign-in form, so confirm no credential field is on screen.
+    return _first_visible(page, EMAIL_INPUT + PASSWORD_INPUT, timeout=0) is None
+
+
+def ensure_signed_in(page: Page, form_url: str, state_path: Optional[str]) -> bool:
+    """
+    Land on the dashboard, reusing a stored session when one is still valid.
+
+    Returns True when the session was reused (no OTP spent).
+    """
+    if state_path:
+        dashboard = dashboard_url_for(form_url)
+        log.info("Trying stored session against %s", dashboard)
+        try:
+            page.goto(dashboard, wait_until="domcontentloaded", timeout=45_000)
+            page.wait_for_timeout(2_500)
+        except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            raise TransientError(f"Could not reach the dashboard: {exc}") from exc
+
+        if _looks_signed_in(page):
+            log.info("Stored session accepted - skipping password and OTP entirely.")
+            return True
+
+        log.info("Stored session rejected (at %s); falling back to full sign-in.", page.url)
+        discard_storage_state()
+
+    sign_in(page, form_url)
+    return False
+
+
 def sign_in(page: Page, form_url: str) -> None:
-    """Sign in to Zoho People, fetching an emailed OTP if Zoho asks for one."""
     env = require_env("ZOHO_EMAIL")
     zoho_email = env["ZOHO_EMAIL"]
     zoho_password = os.getenv("ZOHO_PASSWORD")
 
     log.info("Navigating to %s", form_url)
-    human_pause(what="opening the sign-in page")
-    page.goto(form_url, wait_until="domcontentloaded", timeout=60_000)
+    human_pause(what="opening sign-in page")
+    try:
+        page.goto(form_url, wait_until="domcontentloaded", timeout=60_000)
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        raise TransientError(f"Could not reach the sign-in page: {exc}") from exc
 
-    # Harmless when FORM_URL already points at the accounts app; needed when it
-    # points at a marketing page that gates the form behind a Sign In link.
     sign_in_link = _first_visible(page, ['a:has-text("Sign In")'], timeout=3_000)
     if sign_in_link is not None:
-        log.info("Landing page detected; clicking Sign In.")
         human_pause(page, "clicking Sign In")
         sign_in_link.click()
 
-    log.info("Entering email address...")
     email_field = _require_visible(page, EMAIL_INPUT, "email field")
     _fill_verified(page, email_field, zoho_email, "email address")
     next_button = _require_visible(page, NEXT_BUTTON, "Next button")
     human_pause(page, "clicking Next")
     next_button.click()
 
-    # The password field is already in the DOM (and already reports visible) on
-    # the email step, so it must not be touched until the email step is gone -
-    # otherwise the fill lands on markup Zoho is about to re-render and is lost.
     _wait_hidden(page, EMAIL_INPUT, "email field")
     _check_for_captcha(page)
 
-    # Password step. Passwordless accounts skip straight to the OTP screen, so
-    # a missing password field is not by itself an error.
     password_field = _first_visible(page, PASSWORD_INPUT, timeout=10_000)
     if password_field is not None:
         if not zoho_password:
-            raise AutomationError(
-                "Zoho asked for a password but ZOHO_PASSWORD is not set."
-            )
-        log.info("Entering password...")
+            raise AutomationError("ZOHO_PASSWORD missing.")
         _fill_verified(page, password_field, zoho_password, "password")
         sign_in_button = _require_visible(page, NEXT_BUTTON, "Sign in button")
         human_pause(page, "clicking Sign in")
         sign_in_button.click()
         _wait_hidden(page, PASSWORD_INPUT, "password field")
-    else:
-        log.info("No password field shown; assuming a passwordless/OTP-only login.")
 
-    # Everything from here is timed against the moment the code was requested,
-    # so a stale unread OTP mail can never be picked up.
     requested_at = datetime.now(timezone.utc)
-
     _check_for_captcha(page)
 
-    # Only reachable when the OTP could actually be read; without Gmail
-    # credentials there is no point picking a delivery method.
     gmail_address = os.getenv("GMAIL_ADDRESS")
     if gmail_address:
-        if not _choose_otp_delivery(page, gmail_address):
-            log.info("No MFA method chooser appeared.")
+        _choose_otp_delivery(page, gmail_address)
 
     otp_field = _await_otp_or_dashboard(page)
     if otp_field is not None:
-        log.info("Zoho is asking for a one-time code.")
         otp = fetch_otp_from_gmail(
             timeout=int(os.getenv("OTP_TIMEOUT", "120")),
             sender=os.getenv("OTP_SENDER") or DEFAULT_OTP_SENDER,
@@ -757,108 +820,251 @@ def sign_in(page: Page, form_url: str) -> None:
         )
         fill_otp(page, otp)
 
-        # Some Zoho OTP screens auto-submit once the last digit lands; only
-        # click if a button is still there to click.
         verify_button = _first_visible(page, VERIFY_BUTTON, timeout=3_000)
         if verify_button is not None:
             try:
                 human_pause(page, "clicking Verify")
                 verify_button.click(timeout=10_000)
-            except PlaywrightError as exc:
-                # The widget may have submitted itself the moment the last
-                # digit landed, taking the button with it. Let the URL wait
-                # below decide whether that actually worked.
-                log.warning("Verify click did not land (%s); continuing.", exc)
+            except PlaywrightError:
+                pass
 
-        log.info("Waiting for the signed-in page...")
         try:
             page.wait_for_url(SIGNED_IN_URL_PATTERN, timeout=60_000)
         except PlaywrightTimeoutError as exc:
-            raise AutomationError(
-                f"The code was submitted but sign-in did not complete; still at "
-                f"{page.url}. The code may have expired or been rejected. See "
-                "failure.png."
-            ) from exc
-    else:
-        log.info("No OTP prompt appeared; the account signed in directly.")
+            raise AutomationError("Sign-in completion timeout.") from exc
 
-    # The dashboard URL can appear mid-redirect; if the session is not actually
-    # valid Zoho bounces straight back to accounts. Let the page settle and
-    # re-check, so success means "still on the dashboard", not "passed through".
     try:
         page.wait_for_load_state("domcontentloaded", timeout=30_000)
     except PlaywrightTimeoutError:
-        pass  # a slow SPA asset must not fail an otherwise good sign-in
+        pass
+
     if not SIGNED_IN_URL_PATTERN.search(page.url):
-        raise AutomationError(
-            f"Reached the dashboard but bounced back to {page.url} - the session "
-            "was not established. See failure.png."
-        )
+        raise AutomationError("Bounced from dashboard.")
 
     log.info("Signed in successfully: %s", page.url)
 
 
 def randomize_start() -> None:
-    """
-    Spread scheduled runs out so they never fire at a predictable minute.
-
-    Only *scheduled* runs wait. A manual dispatch has already served its delay:
-    the console runs a cancellable countdown in the browser and only then calls
-    the API, which records the elapsed jitter without sleeping again
-    (`preWaited` in app/api/dispatch/route.ts). DISPATCH_DELAY_MS therefore
-    reports a delay that is already spent — sleeping on it here would make the
-    operator wait for it a second time.
-    """
     if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
         already_waited = os.environ.get("DISPATCH_DELAY_MS", "")
         if already_waited.isdigit() and int(already_waited) > 0:
-            log.info(
-                "Manual dispatch already served %ss of jitter in the console; "
-                "starting immediately.",
-                int(already_waited) // 1000,
-            )
+            log.info("Manual dispatch already waited; skipping delay.")
         return
 
     max_seconds = scheduled_jitter_seconds()
     if max_seconds <= 0:
-        log.info("Jitter is set to zero for today; starting immediately.")
         return
 
     delay_seconds = random.randint(0, max_seconds)
-    log.info(
-        "Scheduled run: sleeping %ds (window is 0-%d min) to randomise punch time...",
-        delay_seconds,
-        max_seconds // 60,
-    )
+    log.info("Scheduled run: sleeping %ds...", delay_seconds)
     time.sleep(delay_seconds)
 
 
-# Zoho People's "My Space" attendance widget. The timer is three sibling
-# <span>s inside #totalInTime holding HH, MM and SS - reading innerText of the
-# container yields "070447", so the spans are read individually.
 TOTAL_TIME_SELECTOR = "#totalInTime"
 ATT_STATUS_SELECTOR = "#att_status"
-
-# Hours that must be logged before the bot is allowed to check out.
 REQUIRED_MINUTES = 9 * 60 + 30
 
 
-class AttendanceSnapshot:
-    """What the attendance widget showed at one moment."""
+# ---------------------------------------------------------------------------
+# Network interception: read attendance straight from Zoho's XHR payloads
+# ---------------------------------------------------------------------------
+#
+# The dashboard widget is populated by a background fetch. Reading that JSON is
+# immune to CSS/DOM churn, so we prefer it and fall back to scraping #totalInTime
+# only when no usable payload arrives.
 
+ATTENDANCE_URL_HINT = re.compile(
+    r"attendance|checkin|check_in|punch|timetracker|atttrack|getAttEntry", re.I
+)
+
+# Keys whose value is a worked-duration. Zoho has used several spellings across
+# releases, so match on shape rather than an exact list.
+_DURATION_KEY = re.compile(
+    r"(total|worked|elapsed|payable|present)[_a-z]*(time|hours?|hrs|duration|sec)", re.I
+)
+_STATUS_KEY = re.compile(r"^(att(endance)?_?)?status$|checkinstatus|punchstatus", re.I)
+_HHMM = re.compile(r"^(\d{1,3})[:hH](\d{1,2})(?:[:mM](\d{1,2}))?$")
+
+MAX_PAYLOAD_BYTES = 2_000_000
+
+
+def _duration_to_seconds(value) -> Optional[int]:
+    """Coerce a Zoho duration value (seconds, minutes, or "HH:MM[:SS]") to seconds."""
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        total = int(value)
+        if total <= 0:
+            return None
+        # Heuristic: a plain number large enough to be epoch-millis is not a
+        # duration. Values under ~24h are seconds; we never see minutes-only
+        # fields large enough to collide meaningfully with a workday.
+        if total > 86_400 * 2:
+            return None
+        # Under a minute is ambiguous - "totalHours": 9 means 9 hours, not 9
+        # seconds. Rather than guess the unit, ignore it and let the DOM answer.
+        if total < 60:
+            return None
+        return total
+
+    if isinstance(value, str):
+        text = value.strip()
+        match = _HHMM.match(text)
+        if match:
+            hours = int(match.group(1))
+            minutes = int(match.group(2))
+            seconds = int(match.group(3) or 0)
+            if hours > 48 or minutes > 59 or seconds > 59:
+                return None
+            return hours * 3600 + minutes * 60 + seconds
+        if text.isdigit():
+            return _duration_to_seconds(int(text))
+
+    return None
+
+
+def _walk_payload(node, depth: int = 0):
+    """Yield (key, value) pairs from arbitrarily nested JSON, depth-capped."""
+    if depth > 8:
+        return
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key, value
+            yield from _walk_payload(value, depth + 1)
+    elif isinstance(node, list):
+        for item in node[:50]:
+            yield from _walk_payload(item, depth + 1)
+
+
+def extract_attendance_from_payload(payload) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Pull (seconds, raw, status) out of a decoded JSON attendance response.
+
+    Returns (None, None, None) when the payload carries nothing usable, which is
+    the common case - most intercepted responses are unrelated.
+    """
+    seconds: Optional[int] = None
+    raw: Optional[str] = None
+    status: Optional[str] = None
+
+    for key, value in _walk_payload(payload):
+        if not isinstance(key, str):
+            continue
+
+        if seconds is None and _DURATION_KEY.search(key):
+            candidate = _duration_to_seconds(value)
+            if candidate is not None:
+                seconds = candidate
+                raw = value if isinstance(value, str) else None
+                log.debug("Duration from payload key %r = %r", key, value)
+
+        if status is None and _STATUS_KEY.search(key) and isinstance(value, str) and value.strip():
+            status = value.strip()
+
+    if seconds is not None and not raw:
+        hours, remainder = divmod(seconds, 3600)
+        raw = f"{hours:02d}:{remainder // 60:02d}:{remainder % 60:02d}"
+
+    return seconds, raw, status
+
+
+class AttendanceInterceptor:
+    """Records the most recent attendance-shaped JSON response seen on the page."""
+
+    def __init__(self) -> None:
+        self.seconds: Optional[int] = None
+        self.raw: Optional[str] = None
+        self.status: Optional[str] = None
+        self.seen_urls: list[str] = []
+        self.hits = 0
+
+    def attach(self, page: Page) -> None:
+        page.on("response", self._on_response)
+
+    def _on_response(self, response) -> None:
+        # Handler exceptions are swallowed by Playwright but would still spam
+        # the log, and a bad payload must never take down the run.
+        try:
+            url = response.url
+            if not ATTENDANCE_URL_HINT.search(url):
+                return
+
+            content_type = (response.headers or {}).get("content-type", "")
+            if "json" not in content_type.lower():
+                return
+
+            body = response.body()
+            if len(body) > MAX_PAYLOAD_BYTES:
+                log.debug("Skipping oversized payload from %s", url[:120])
+                return
+
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            return
+
+        self.seen_urls.append(url.split("?")[0][:160])
+
+        try:
+            seconds, raw, status = extract_attendance_from_payload(payload)
+        except Exception as exc:
+            log.debug("Payload parse failed for %s: %s", url[:120], exc)
+            return
+
+        if seconds is None and status is None:
+            return
+
+        self.hits += 1
+        if seconds is not None:
+            self.seconds, self.raw = seconds, raw
+        if status is not None:
+            self.status = status
+        log.info(
+            "Intercepted attendance payload from %s (seconds=%s, status=%s)",
+            url.split("?")[0][-60:],
+            seconds,
+            status,
+        )
+
+    def snapshot(self) -> Optional["AttendanceSnapshot"]:
+        if self.seconds is None and self.status is None:
+            return None
+        return AttendanceSnapshot(self.status, self.seconds, self.raw, origin="api")
+
+    def log_summary(self) -> None:
+        if self.hits:
+            return
+        if self.seen_urls:
+            log.info(
+                "Saw %d attendance-shaped request(s) but parsed none: %s",
+                len(self.seen_urls),
+                ", ".join(dict.fromkeys(self.seen_urls))[:400],
+            )
+        else:
+            log.info("No attendance XHR intercepted; DOM scraping is the only source.")
+
+
+# Populated in run(); read by read_attendance().
+INTERCEPTOR: Optional[AttendanceInterceptor] = None
+
+
+class AttendanceSnapshot:
     def __init__(
         self,
         status: Optional[str],
         seconds: Optional[int],
         raw: Optional[str],
         settled: bool = True,
+        origin: str = "dom",
     ):
         self.status = status
         self.seconds = seconds
         self.raw = raw
-        # False when the widget never filled in and we gave up waiting, so a
-        # zero here means "we could not read it", not "no time is logged".
         self.settled = settled
+        self.origin = origin  # "api" (intercepted XHR) or "dom" (scraped widget)
+        # Set on merged snapshots so the checkout guard can take the
+        # conservative reading when API and DOM disagree.
+        self.dom_seconds: Optional[int] = None
 
     @property
     def minutes(self) -> Optional[int]:
@@ -866,19 +1072,15 @@ class AttendanceSnapshot:
 
     def describe(self) -> str:
         if self.seconds is None:
-            return f"status={self.status or 'unknown'}, time unreadable"
+            return f"status={self.status or 'unknown'}, time unreadable [{self.origin}]"
         h, rem = divmod(self.seconds, 3600)
-        return f"status={self.status or 'unknown'}, logged {h}h {rem // 60}m ({self.raw})"
+        return (
+            f"status={self.status or 'unknown'}, "
+            f"logged {h}h {rem // 60}m ({self.raw}) [{self.origin}]"
+        )
 
 
 def _parse_timer_spans(page: Page) -> tuple[Optional[int], Optional[str]]:
-    """
-    Read #totalInTime's spans into (seconds, "HH:MM:SS").
-
-    The widget renders the running total as one span per unit. Older tenants
-    render a single text node instead, so a plain HH:MM(:SS) string is accepted
-    as a fallback rather than failing the whole read.
-    """
     container = page.locator(TOTAL_TIME_SELECTOR).first
     container.wait_for(state="attached", timeout=10_000)
 
@@ -903,77 +1105,71 @@ def _parse_timer_spans(page: Page) -> tuple[Optional[int], Optional[str]]:
     return hours * 3600 + minutes * 60 + seconds, raw
 
 
-# My Space is an SPA: #totalInTime and #att_status are in the DOM, with an
-# empty status and a 00:00:00 placeholder, *before* the XHR that fills them
-# lands. wait_for(state="attached") is satisfied by that placeholder, so a read
-# taken the moment the page arrives reports a confident 0h 0m for a day with
-# hours on it - which also makes verify_checkout_eligibility abort a perfectly
-# legitimate check-out. So the widget is polled until it fills in.
-WIDGET_SETTLE_TIMEOUT = 20  # seconds
+WIDGET_SETTLE_TIMEOUT = 20
 
 
 def _read_attendance_once(page: Page) -> AttendanceSnapshot:
-    """One read of the widget, placeholders and all. Never raises."""
     status: Optional[str] = None
     try:
         status_el = page.locator(ATT_STATUS_SELECTOR).first
         status_el.wait_for(state="attached", timeout=10_000)
         status = (status_el.inner_text() or "").strip() or None
     except (PlaywrightError, PlaywrightTimeoutError):
-        log.warning("Could not read %s.", ATT_STATUS_SELECTOR)
+        pass
 
     try:
         seconds, raw = _parse_timer_spans(page)
     except (PlaywrightError, PlaywrightTimeoutError):
-        log.warning("Could not read %s.", TOTAL_TIME_SELECTOR)
         seconds, raw = None, None
 
     return AttendanceSnapshot(status, seconds, raw)
 
 
 def read_attendance(page: Page) -> AttendanceSnapshot:
-    """
-    Read the attendance widget once it has loaded its data.
-
-    A zero timer is indistinguishable from the pre-load placeholder, so both
-    are treated as "not settled yet" and polled. Waiting out the full timeout
-    is not a failure - a genuine 0h 0m (nobody has checked in yet today) looks
-    exactly the same, and is reported as such. Never raises: an unreadable
-    widget is data the dashboard should see, not a crash.
-    """
     deadline = time.monotonic() + WIDGET_SETTLE_TIMEOUT
     snapshot = _read_attendance_once(page)
 
     while not (snapshot.status and snapshot.seconds):
         if time.monotonic() >= deadline:
-            log.info(
-                "Widget still reads %s after %ds; taking it as final.",
-                snapshot.describe(),
-                WIDGET_SETTLE_TIMEOUT,
-            )
-            # A status without a time still means the widget loaded - the
-            # timer really is at zero. Only a widget showing *nothing* (no
-            # status, no time) counts as never having loaded, which is the
-            # narrow case callers are allowed to treat as "unknown".
             snapshot.settled = bool(snapshot.status) or bool(snapshot.seconds)
             break
         page.wait_for_timeout(1_000)
         snapshot = _read_attendance_once(page)
 
-    log.info("Attendance widget: %s", snapshot.describe())
+    # Prefer the intercepted API payload - it survives DOM changes. The DOM read
+    # above still runs because it is what forces the XHR to have happened, and
+    # it backfills whichever field the payload did not carry.
+    api = INTERCEPTOR.snapshot() if INTERCEPTOR is not None else None
+    if api is not None:
+        merged = AttendanceSnapshot(
+            status=api.status or snapshot.status,
+            seconds=api.seconds if api.seconds is not None else snapshot.seconds,
+            raw=api.raw if api.seconds is not None else snapshot.raw,
+            settled=True,
+            origin="api" if api.seconds is not None else "api+dom",
+        )
+        if (
+            snapshot.seconds is not None
+            and api.seconds is not None
+            and abs(snapshot.seconds - api.seconds) > 300
+        ):
+            log.warning(
+                "API and DOM disagree on elapsed time (api=%ss, dom=%ss); trusting API.",
+                api.seconds,
+                snapshot.seconds,
+            )
+        merged.dom_seconds = snapshot.seconds
+        snapshot = merged
+    elif INTERCEPTOR is not None:
+        INTERCEPTOR.log_summary()
+
+    log.info("Attendance: %s", snapshot.describe())
     return snapshot
 
 
 def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
-    """
-    POST the snapshot to the dashboard so the console can show it.
-
-    Best-effort by design: the punch is the job, and a dashboard that is down
-    must not fail a run that already succeeded.
-    """
     base = (os.getenv("CONTROL_CENTER_URL") or "").rstrip("/")
     if not base:
-        log.info("CONTROL_CENTER_URL is not set; skipping the attendance report.")
         return
 
     body = json.dumps(
@@ -981,6 +1177,7 @@ def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
             "status": snapshot.status,
             "loggedSeconds": snapshot.seconds,
             "rawTime": snapshot.raw,
+            "readVia": snapshot.origin,
             "source": source,
             "runId": os.getenv("DISPATCH_RUN_ID") or None,
         }
@@ -994,63 +1191,27 @@ def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
 
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            log.info("Reported attendance to the dashboard (HTTP %s).", response.status)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 401:
-            # The endpoint only rejects when it *has* a secret and ours does not
-            # match, so this is always a config mismatch, never a transient fault.
-            log.warning(
-                "Dashboard rejected the attendance report (401). DISPATCH_SECRET "
-                "%s here and must match the value the deployed console has; set "
-                "the same string in both the GitHub repo secrets and the Amplify "
-                "environment variables.",
-                "is set" if secret else "is NOT set",
-            )
-        else:
-            log.warning("Could not report attendance to the dashboard: %s", exc)
-    except Exception as exc:  # noqa: BLE001 - reporting must never fail a run
-        log.warning("Could not report attendance to the dashboard: %s", exc)
+            log.info("Reported attendance to dashboard (HTTP %s).", response.status)
+    except Exception as exc:
+        log.warning("Could not report attendance to dashboard: %s", exc)
 
 
 def verify_checkout_eligibility(page: Page) -> None:
-    """
-    Refuse to check out before 9.5 hours are logged.
-
-    Fails *closed* only on a value we could actually read: an unreadable widget
-    warns and proceeds, because blocking a legitimate check-out over a selector
-    change would strand the operator checked in overnight.
-    """
     snapshot = read_attendance(page)
 
-    if snapshot.minutes is None:
-        log.warning(
-            "Could not read the logged time from %s; skipping the 9.5h check.",
-            TOTAL_TIME_SELECTOR,
-        )
+    if snapshot.minutes is None or (not snapshot.settled and snapshot.minutes == 0):
+        log.warning("Could not read timer; skipping 9.5h check.")
+        send_telegram_msg("⚠️ Checking out without 9.5h verification - timer unreadable.")
         return
 
-    # A zero from a widget that never loaded at all is a *failed read*, not a
-    # real zero, and takes the same fail-open path as the unreadable case above
-    # - otherwise a selector drift silently strands the operator checked in
-    # overnight, which is the failure this function exists to avoid. A loaded
-    # widget reading zero is not covered by this: the timer ticks, so it cannot
-    # stay at exactly zero across the settle window unless it is not running.
-    if not snapshot.settled and snapshot.minutes == 0:
-        log.warning(
-            "The widget never loaded a time (still %s after %ds); checking out "
-            "without the 9.5h check.",
-            snapshot.raw or "blank",
-            WIDGET_SETTLE_TIMEOUT,
-        )
-        send_telegram_msg(
-            "⚠️ Checking out without the 9.5h verification - Zoho's timer never "
-            "loaded. Confirm the hours in Zoho."
-        )
-        return
+    # When both the API payload and the widget produced a number, trust the
+    # smaller one. Under-reading costs a retry; over-reading punches out early.
+    effective_seconds = snapshot.seconds
+    if snapshot.dom_seconds is not None and effective_seconds is not None:
+        effective_seconds = min(effective_seconds, snapshot.dom_seconds)
 
-    total_minutes = snapshot.minutes
+    total_minutes = effective_seconds // 60
     hours, minutes = divmod(total_minutes, 60)
-    log.info("Current logged time read as: %dh %dm (%d total minutes)", hours, minutes, total_minutes)
 
     if total_minutes < REQUIRED_MINUTES:
         raise AutomationError(
@@ -1061,76 +1222,114 @@ def verify_checkout_eligibility(page: Page) -> None:
 
 
 def run_status_check(page: Page) -> None:
-    """Read the widget and report it. Nothing is punched."""
-    log.info("STATUS_CHECK: reading the attendance widget...")
+    log.info("STATUS_CHECK: reading attendance widget...")
     snapshot = read_attendance(page)
     report_attendance(snapshot, source="STATUS_CHECK")
 
-    if snapshot.seconds is None:
-        # Loud, but not a failure: the dashboard now shows "unreadable" rather
-        # than a stale number pretending to be current.
-        log.warning("The widget was on screen but could not be parsed.")
-        try:
-            page.screenshot(path="failure.png", full_page=True)
-            log.info("Saved failure.png for the unparsed widget.")
-        except PlaywrightError:
-            pass
+
+def _punch_label_pattern(target_text: str) -> re.Pattern:
+    """
+    "Check-in" -> /check\\s*-?\\s*in\\b/i
+
+    Matches Check-in, Check In, CheckIn and Check_in. The trailing \\b keeps
+    "Check-in" from matching a "Check-in Time" column header, and the two
+    directions never collide because "in" and "out" are anchored separately.
+    """
+    direction = "out" if "out" in target_text.lower() else "in"
+    return re.compile(rf"\bcheck[\s_-]*{direction}\b", re.I)
+
+
+PUNCH_LOOKUP_TIMEOUT = 15  # seconds to keep re-probing every strategy
 
 
 def _punch_button(page: Page, target_text: str):
     """
-    Locate the check-in/check-out button.
+    Find the punch button without depending on any class name or ID.
 
-    Role first: a bare text= selector matches *any* element carrying the words,
-    and My Space is full of them (menu entries, feed items), so it can bind to
-    something that is not the button at all - and clicking it looks exactly
-    like success. The text= form stays as a fallback for tenants that render
-    the control as a div rather than a button.
+    Ordered most-precise to most-structural. The later strategies exist because
+    Zoho ships Webpack builds with generated class names (`css-1x9a2b`) and has
+    stripped readable IDs before; accessible role + visible text is what
+    survives, since a human still has to read the button.
     """
-    by_role = page.get_by_role("button", name=target_text, exact=True).first
-    try:
-        by_role.wait_for(state="visible", timeout=8_000)
-        return by_role
-    except (PlaywrightError, PlaywrightTimeoutError):
-        log.info("No button role matched %r; falling back to a text match.", target_text)
+    page.wait_for_load_state("domcontentloaded")
+    pattern = _punch_label_pattern(target_text)
 
-    fallback = page.locator(f"text='{target_text}'").first
-    fallback.wait_for(state="visible", timeout=10_000)
-    return fallback
+    def build() -> list[tuple[str, object]]:
+        return [
+        # 1. Exact accessible name - unambiguous when Zoho keeps the label as-is.
+        ("exact role", page.get_by_role("button", name=target_text, exact=True)),
+        # 2. Same role, tolerant of spacing/casing drift ("Check In", "CheckIn").
+        ("fuzzy role", page.get_by_role("button", name=pattern)),
+        # 3. ARIA-labelled control that renders as a div rather than a <button>.
+        ("aria-label", page.locator(f'[aria-label*="{target_text}" i]')),
+        # 4. Legacy IDs, still the fastest hit when they are present.
+        ("legacy id", page.locator("#checkIn" if "in" in target_text.lower()
+                                   and "out" not in target_text.lower() else "#checkOut")),
+        # 5. Any clickable element whose visible text matches.
+        ("clickable text", page.locator(
+            'button, [role="button"], input[type="submit"], a'
+        ).filter(has_text=pattern)),
+        # 6. Layout-relative: the control sitting next to the attendance widget.
+        #    Immune to DOM restructuring as long as the visual arrangement holds.
+        ("near attendance widget", page.locator(
+            f'button:near(:text("Attendance")), [role="button"]:near(:text("Attendance"))'
+        ).filter(has_text=pattern)),
+        # 7. Last resort: the text node itself, clicking whatever renders it.
+        ("bare text", page.get_by_text(pattern)),
+        ]
+
+    # Poll all strategies cheaply rather than blocking on each one in turn:
+    # count() does not wait, so a strategy that matches nothing costs ~nothing.
+    # Seven blocking waits would otherwise burn ~30s before the first fallback
+    # even gets a look in, and nearly a minute before we could screenshot.
+    deadline = time.monotonic() + PUNCH_LOOKUP_TIMEOUT
+    while True:
+        for label, locator in build():
+            try:
+                if locator.count() == 0:  # type: ignore[union-attr]
+                    continue
+                candidate = locator.first  # type: ignore[union-attr]
+                if not candidate.is_visible():
+                    continue
+                log.info("Found %s button via %s strategy.", target_text, label)
+                return candidate
+            except (PlaywrightError, PlaywrightTimeoutError):
+                continue
+
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(500)  # widget may still be rendering
+
+    raise AutomationError(
+        f"Could not locate the {target_text} button by role, text, id, aria-label "
+        f"or layout. Zoho's dashboard markup has probably changed - check the trace."
+    )
 
 
 def _confirm_punch(page: Page, target_text: str, timeout: int = 20_000) -> None:
-    """
-    Verify Zoho registered the punch, instead of trusting that click() returned.
-
-    A click that lands on the wrong element returns perfectly happily, so the
-    old "Successfully clicked" log (and the Telegram tick behind it) could fire
-    on a run that punched nothing at all. The check is direction-agnostic: the
-    button we just pressed must stop being on screen, because Zoho replaces it
-    with the opposite action. Waiting for that opposite label instead would
-    assume which one comes back, which differs between check-in and check-out.
-    """
+    """The punch is confirmed when the button we clicked stops being offered."""
     deadline = time.monotonic() + timeout / 1000
-    selector = f"text='{target_text}'"
+    pattern = _punch_label_pattern(target_text)
 
     while time.monotonic() < deadline:
-        if _first_visible(page, [selector], timeout=0) is None:
-            log.info("Confirmed: the %s button is gone, so the punch went through.", target_text)
+        try:
+            remaining = page.get_by_role("button", name=pattern).count()
+        except PlaywrightError:
+            remaining = 1  # transient DOM churn; keep waiting
+        if remaining == 0:
+            log.info("Confirmed: %s button is gone.", target_text)
             return
         page.wait_for_timeout(500)
 
     page.screenshot(path="failure.png", full_page=True)
-    raise AutomationError(
-        f"The {target_text} button was clicked but was still on screen "
-        f"{timeout // 1000}s later, so Zoho did not register the punch. See "
-        "failure.png."
-    )
+    raise AutomationError(f"The {target_text} button stayed on screen; punch unconfirmed.")
 
 
 def punch_attendance(page: Page) -> None:
-    """Determine and execute the check-in or check-out action based on dashboard input or UTC time."""
-    log.info("Determining attendance action...")
-    
+    """Read state first to avoid duplicate punches, then execute punch."""
+    snapshot = read_attendance(page)
+    status_str = (snapshot.status or "").lower()
+
     dashboard_action = os.environ.get("DISPATCH_ACTION")
     
     if dashboard_action == "ACTION_ALPHA":
@@ -1138,55 +1337,62 @@ def punch_attendance(page: Page) -> None:
     elif dashboard_action == "ACTION_BETA":
         target_text = "Check-out"
     else:
-        is_morning = datetime.now(timezone.utc).hour < 10
-        target_text = "Check-in" if is_morning else "Check-out"
-    
-    log.info("Target action: %s", target_text)
-    
-    # --- NEW SAFETY CHECK ---
+        # Dynamic determination: if checked in -> Check-out; else -> Check-in
+        if "in" in status_str and "out" not in status_str:
+            target_text = "Check-out"
+        elif "out" in status_str:
+            target_text = "Check-in"
+        else:
+            is_morning = datetime.now(timezone.utc).hour < 10
+            target_text = "Check-in" if is_morning else "Check-out"
+
+    log.info("Target action: %s (Current Status: %s)", target_text, snapshot.status)
+
+    # --- IDEMPOTENCY / DUP-CHECK ---
+    if target_text == "Check-in" and ("in" in status_str and "out" not in status_str):
+        log.info("Already checked in! Skipping duplicate Check-in.")
+        send_telegram_msg(f"ℹ️ Already checked in at {_ist_now().strftime('%H:%M')} IST. Skipping duplicate punch.")
+        report_attendance(snapshot, source=dashboard_action or "PUNCH")
+        return
+
+    if target_text == "Check-out" and "out" in status_str:
+        log.info("Already checked out! Skipping duplicate Check-out.")
+        send_telegram_msg(f"ℹ️ Already checked out at {_ist_now().strftime('%H:%M')} IST. Skipping duplicate punch.")
+        report_attendance(snapshot, source=dashboard_action or "PUNCH")
+        return
+
     if target_text == "Check-out":
         log.info("Executing 9.5-hour safety check before checking out...")
         verify_checkout_eligibility(page)
-    # ------------------------
-    
+
+    # Clear anything that drifted in while we were reading the widget - a modal
+    # here intercepts the click and the run times out looking for the button.
+    dismiss_modals(page, rounds=2)
+
     try:
         button = _punch_button(page, target_text)
         human_pause(page, f"clicking {target_text}")
         button.click()
-        log.info("Clicked %s; waiting for Zoho to register it...", target_text)
+        log.info("Clicked %s; waiting for confirmation...", target_text)
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
-        log.error(
-            "Could not find or click the '%s' button (%s). You may already be "
-            "punched in/out.",
-            target_text,
-            exc,
-        )
         page.screenshot(path="failure.png", full_page=True)
         raise AutomationError(f"Failed to find or click the {target_text} button.") from exc
 
-    # Nothing below is announced as success until this returns.
     _confirm_punch(page, target_text)
 
     page.wait_for_timeout(2_000)
     page.screenshot(path="success.png", full_page=True)
-    log.info("Saved success.png")
-
-    # The widget has just been updated by the punch, so this is the freshest
-    # reading there is — the console shows it without a separate check.
-    report_attendance(read_attendance(page), source=dashboard_action or "PUNCH")
+    final = read_attendance(page)
+    report_attendance(final, source=dashboard_action or "PUNCH")
 
     send_telegram_msg(
-        f"✅ {target_text} confirmed at {_ist_now().strftime('%H:%M')} IST."
+        f"✅ {target_text} confirmed at {_ist_now().strftime('%H:%M')} IST.\n"
+        f"{final.describe()}",
+        photo="success.png",
     )
 
 
-# The dashboard's Neon database is the single source of truth for *when* the
-# bot may run: the holiday calendar and the weekday matrix both live there and
-# are edited in the UI. The bot asks rather than keeping its own copy, so there
-# is no second list to drift out of sync.
 IST = timezone(timedelta(hours=5, minutes=30))
-
-# Falls back to the schedule matrix default when the dashboard is unreachable.
 DEFAULT_JITTER_MINUTES = 25
 
 
@@ -1195,18 +1401,12 @@ def _ist_now() -> datetime:
 
 
 def _dashboard_get(path: str) -> Optional[dict]:
-    """
-    GET a dashboard API endpoint. Returns None on any failure — callers decide
-    what a missing answer means rather than having it decided for them here.
-    """
     base = (os.getenv("CONTROL_CENTER_URL") or "").rstrip("/")
     if not base:
         return None
 
     request = urllib.request.Request(f"{base}{path}")
     request.add_header("Accept", "application/json")
-    # Harmless today (the read endpoints are open) and already correct if those
-    # endpoints are ever locked down to the shared secret.
     secret = os.getenv("DISPATCH_SECRET")
     if secret:
         request.add_header("Authorization", f"Bearer {secret}")
@@ -1214,69 +1414,42 @@ def _dashboard_get(path: str) -> Optional[dict]:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001 - network, DNS, JSON, HTTP all equal here
+    except Exception as exc:
         log.warning("Dashboard request %s failed: %s", path, exc)
         return None
 
 
 def check_dashboard_policy() -> None:
-    """
-    Exit cleanly when the dashboard says today is not a running day.
-
-    Only scheduled runs are subject to this. A manual dispatch is a deliberate
-    human act — the API already permits it on an excepted day, and the console
-    banners why — so it is never blocked here.
-
-    Fails *open*: if the dashboard cannot be reached the run proceeds, because a
-    missed attendance punch is the more expensive failure. The warning is loud
-    and, when Telegram is configured, pushed.
-    """
     if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
         return
 
-    today = _ist_now()
-    today_str = today.strftime("%Y-%m-%d")
+    today_str = _ist_now().strftime("%Y-%m-%d")
 
     exceptions = _dashboard_get("/api/exceptions?upcoming=1")
     if exceptions is None:
-        log.warning(
-            "Could not reach the dashboard; proceeding without the holiday check."
-        )
-        send_telegram_msg(
-            f"⚠️ Bot ran on {today_str} without reaching the control center. "
-            "Holiday and pause settings were not applied."
-        )
+        log.warning("Could not reach dashboard; proceeding.")
         return
 
-    # The API answers { "exceptions": [ { "exceptionDate": "YYYY-MM-DD", ... } ] }
     for entry in exceptions.get("exceptions", []):
         if entry.get("exceptionDate") == today_str:
             reason = entry.get("reason", "no reason given")
-            log.info("Exception on %s (%s). Standing down.", today_str, reason)
+            log.info("Holiday exception on %s (%s). Standing down.", today_str, reason)
             send_telegram_msg(f"🌴 {today_str} is marked '{reason}'. No punch today.")
-            sys.exit(0)  # clean exit: a skipped day is a success, not a failure
+            sys.exit(0)
 
-    # The weekday matrix is the same switch the console's "Pause automation"
-    # button writes to, so pausing there must also stop the cron.
     schedule = _dashboard_get("/api/schedule")
     if schedule is None:
         return
 
-    weekday = today.strftime("%A")
+    weekday = _ist_now().strftime("%A")
     for row in schedule.get("schedule", []):
         if row.get("dayOfWeek") == weekday and row.get("enabled") is False:
-            log.info("%s is disabled in the schedule matrix. Standing down.", weekday)
+            log.info("%s is disabled in schedule matrix. Standing down.", weekday)
             send_telegram_msg(f"⏸️ Automation is paused for {weekday}. No punch today.")
             sys.exit(0)
 
 
 def scheduled_jitter_seconds() -> int:
-    """
-    Maximum jitter for a scheduled run, in seconds, taken from the dashboard's
-    slider for today. Hardcoding it here would recreate exactly the drift this
-    function exists to remove: the console renders the firing window from
-    `randomOffsetMinutes`, so that value has to be the one actually slept.
-    """
     schedule = _dashboard_get("/api/schedule")
     if schedule:
         weekday = _ist_now().strftime("%A")
@@ -1293,116 +1466,321 @@ def scheduled_jitter_seconds() -> int:
     return DEFAULT_JITTER_MINUTES * 60
 
 
-def send_telegram_msg(text: str) -> None:
-    """Send a silent push notification via Telegram."""
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CAPTION_LIMIT = 1024  # Telegram's cap on sendPhoto captions
+TELEGRAM_PHOTO_LIMIT = 10 * 1024 * 1024  # sendPhoto rejects anything larger
+
+
+def _telegram_credentials() -> Optional[tuple[str, str]]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
-    if not bot_token or not chat_id:
-        return  # Silently skip if Telegram isn't configured
-        
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text, "disable_notification": "true"}).encode("utf-8")
-    
+    return (token, chat_id) if token and chat_id else None
+
+
+def _multipart_body(
+    fields: dict[str, str], name: str, filename: str, payload: bytes
+) -> tuple[bytes, str]:
+    """Build a multipart/form-data body with the stdlib - no `requests` needed."""
+    boundary = f"----bot{uuid.uuid4().hex}"
+    line_end = b"\r\n"
+    chunks: list[bytes] = []
+
+    for key, value in fields.items():
+        chunks += [
+            f"--{boundary}".encode(),
+            line_end,
+            f'Content-Disposition: form-data; name="{key}"'.encode(),
+            line_end * 2,
+            str(value).encode("utf-8"),
+            line_end,
+        ]
+
+    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    chunks += [
+        f"--{boundary}".encode(),
+        line_end,
+        f'Content-Disposition: form-data; name="{name}"; filename="{filename}"'.encode(),
+        line_end,
+        f"Content-Type: {content_type}".encode(),
+        line_end * 2,
+        payload,
+        line_end,
+        f"--{boundary}--".encode(),
+        line_end,
+    ]
+
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+
+def send_telegram_photo(photo_path: str, caption: str) -> bool:
+    """
+    Push a screenshot straight to the phone. Returns False if it could not be
+    sent, so the caller can fall back to plain text - a notification that never
+    arrives is worse than one without a picture.
+    """
+    creds = _telegram_credentials()
+    if creds is None:
+        return False
+    token, chat_id = creds
+
     try:
-        urllib.request.urlopen(url, data=data, timeout=5)
-        log.info("Sent Telegram notification.")
+        path = Path(photo_path)
+        if not path.exists() or path.stat().st_size == 0:
+            return False
+        if path.stat().st_size > TELEGRAM_PHOTO_LIMIT:
+            log.warning("%s is too large for Telegram (%d bytes).", path, path.stat().st_size)
+            return False
+        payload = path.read_bytes()
+    except OSError as exc:
+        log.warning("Could not read %s for Telegram: %s", photo_path, exc)
+        return False
+
+    body, content_type = _multipart_body(
+        {
+            "chat_id": chat_id,
+            "caption": caption[:TELEGRAM_CAPTION_LIMIT],
+            "disable_notification": "true",
+        },
+        "photo",
+        path.name,
+        payload,
+    )
+
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendPhoto", data=body, method="POST"
+    )
+    request.add_header("Content-Type", content_type)
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            ok = 200 <= response.status < 300
+            if ok:
+                log.info("Sent %s to Telegram.", path.name)
+            return ok
+    except Exception as exc:
+        log.warning("Failed to send Telegram photo: %s", exc)
+        return False
+
+
+def send_telegram_msg(text: str, photo: Optional[str] = None) -> None:
+    """
+    Notify Telegram, attaching a screenshot when one is available.
+
+    Falls back to a text-only message whenever the photo cannot be delivered.
+    """
+    creds = _telegram_credentials()
+    if creds is None:
+        return
+    token, chat_id = creds
+
+    if photo and send_telegram_photo(photo, text):
+        return
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode(
+        {"chat_id": chat_id, "text": text, "disable_notification": "true"}
+    ).encode("utf-8")
+
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10)
     except Exception as exc:
         log.warning("Failed to send Telegram notification: %s", exc)
 
+
+# ---------------------------------------------------------------------------
+# Browser hardening: stealth, proxy, tracing
+# ---------------------------------------------------------------------------
+
+TRACE_PATH = "trace.zip"
+
+
+def build_proxy_config() -> Optional[dict]:
+    """Route browser traffic through a proxy when PROXY_SERVER is set."""
+    server = (os.getenv("PROXY_SERVER") or "").strip()
+    if not server:
+        return None
+
+    proxy = {"server": server}
+    username = os.getenv("PROXY_USERNAME")
+    password = os.getenv("PROXY_PASSWORD")
+    if username and password:
+        proxy["username"] = username
+        proxy["password"] = password
+    bypass = os.getenv("PROXY_BYPASS")
+    if bypass:
+        proxy["bypass"] = bypass
+
+    # Log the host only - credentials and the full URL stay out of CI logs.
+    host = urllib.parse.urlsplit(server if "://" in server else f"//{server}").hostname
+    log.info("Routing browser traffic through proxy host %s.", host or "configured")
+    return proxy
+
+
+def apply_stealth(page: Page) -> bool:
+    """
+    Mask headless fingerprints (navigator.webdriver, plugins, chrome runtime).
+
+    Optional dependency and version-tolerant: playwright-stealth 2.x exposes a
+    Stealth class, 1.x a stealth_sync function. If neither imports, the run
+    continues unmasked rather than failing.
+    """
+    if os.getenv("STEALTH", "true").lower() in ("false", "0", "off"):
+        log.info("Stealth disabled by STEALTH env var.")
+        return False
+
+    try:
+        import playwright_stealth  # type: ignore
+    except ImportError:
+        log.warning("playwright-stealth not installed; running unmasked.")
+        return False
+
+    try:
+        stealth_cls = getattr(playwright_stealth, "Stealth", None)
+        if stealth_cls is not None:  # 2.x
+            stealth_cls().apply_stealth_sync(page)
+        else:  # 1.x
+            playwright_stealth.stealth_sync(page)
+    except Exception as exc:
+        log.warning("Could not apply stealth patches (%s); continuing.", exc)
+        return False
+
+    log.info("Stealth patches applied.")
+    return True
+
+
+def _trace_mode() -> str:
+    """on | failure | off. Defaults to on in CI, off locally."""
+    default = "on" if os.getenv("GITHUB_ACTIONS") == "true" else "off"
+    mode = (os.getenv("TRACE") or default).strip().lower()
+    return mode if mode in ("on", "failure", "off") else default
+
+
+def start_tracing(context) -> bool:
+    if _trace_mode() == "off":
+        return False
+    try:
+        context.tracing.start(screenshots=True, snapshots=True, sources=True)
+        log.info("Playwright tracing started -> %s", TRACE_PATH)
+        return True
+    except Exception as exc:
+        log.warning("Could not start tracing: %s", exc)
+        return False
+
+
+def stop_tracing(context, tracing_on: bool, failed: bool) -> None:
+    if not tracing_on:
+        return
+    keep = _trace_mode() == "on" or failed
+    try:
+        if keep:
+            context.tracing.stop(path=TRACE_PATH)
+            log.info(
+                "Trace written to %s - inspect with `playwright show-trace %s`.",
+                TRACE_PATH,
+                TRACE_PATH,
+            )
+        else:
+            context.tracing.stop()
+    except Exception as exc:
+        log.warning("Could not stop tracing cleanly: %s", exc)
+
+
 def run() -> None:
-    """Drive one full automation run."""
-    # A status check is a read: no holiday policy applies to looking at a page,
-    # and jitter exists to hide *punch* times, so neither gate is relevant. The
-    # operator is waiting on this one, so it starts immediately.
+    global INTERCEPTOR
+
     status_check = os.getenv("DISPATCH_MODE", "PUNCH").upper() == "STATUS_CHECK"
 
     if not status_check:
-        # Order matters: ask whether today is a running day *before* sleeping out
-        # the jitter, or a holiday costs 25 minutes of runner time to discover.
         check_dashboard_policy()
         randomize_start()
 
-
-    # `or` rather than a getenv default: the workflow sets FORM_URL from an
-    # optional dispatch input, which is an empty string on scheduled runs.
     form_url = os.getenv("FORM_URL") or DEFAULT_FORM_URL
     headless = os.getenv("HEADLESS", "true").lower() != "false"
 
-    log.info(
-        "=== Automation run starting (%s) ===",
-        "STATUS_CHECK" if status_check else "PUNCH",
-    )
+    log.info("=== Automation run starting (%s) ===", "STATUS_CHECK" if status_check else "PUNCH")
     started = time.monotonic()
 
     with sync_playwright() as playwright:
-        log.info("Launching Chromium (headless=%s)...", headless)
-        browser = playwright.chromium.launch(headless=headless)
+        browser = playwright.chromium.launch(
+            headless=headless,
+            proxy=build_proxy_config(),
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        state_path = load_storage_state()
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
             geolocation={"latitude": 18.506154, "longitude": 73.761416},
             permissions=["geolocation"],
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
+            locale="en-IN",
+            timezone_id="Asia/Kolkata",
+            storage_state=state_path,
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
+        tracing_on = start_tracing(context)
+
         page = context.new_page()
         page.set_default_timeout(30_000)
+        apply_stealth(page)
 
+        INTERCEPTOR = AttendanceInterceptor()
+        INTERCEPTOR.attach(page)
+
+        failed = False
         try:
-            sign_in(page, form_url)
+            reused = ensure_signed_in(page, form_url, state_path)
+            # Refresh the stored session on every successful landing, so the
+            # 7-day clock restarts and a rotated cookie is not lost.
+            save_storage_state(context)
+            log.info("Session %s.", "reused (no OTP spent)" if reused else "established")
+
+            dismiss_modals(page)
             if status_check:
                 run_status_check(page)
             else:
                 punch_attendance(page)
         except Exception as exc:
-            # A screenshot is the single most useful artifact when CI fails, and
-            # every failure mode here is "the page did not look as expected".
+            failed = True
             try:
                 page.screenshot(path="failure.png", full_page=True)
-                log.info("Saved failure.png")
             except PlaywrightError:
-                log.warning("Could not capture failure.png.")
+                pass
             if isinstance(exc, PlaywrightTimeoutError):
-                raise AutomationError(f"Timed out interacting with the page: {exc}") from exc
+                raise AutomationError(f"Timed out interacting with page: {exc}") from exc
             raise
         finally:
+            stop_tracing(context, tracing_on, failed)
             context.close()
             browser.close()
-            log.info("Browser closed.")
 
     log.info("=== Automation run finished in %.1fs ===", time.monotonic() - started)
 
 
-
-
-
-
-def _notify_failure(detail: str) -> None:
-    """
-    Push the failure, not just log it.
-
-    Success and stand-down days were already announced, so silence read as
-    "all fine" when it actually meant the punch never happened - the one
-    outcome that needs a human the same evening, and the one nothing reported.
-    """
+def _notify_failure(detail: str, retryable: bool) -> None:
     mode = os.getenv("DISPATCH_MODE") or "PUNCH"
     action = os.getenv("DISPATCH_ACTION") or "auto"
+    icon = "🔁" if retryable else "❌"
+    suffix = " (transient - the workflow will retry)" if retryable else ""
+    # The screenshot is the whole point: see what the bot saw, on the phone.
     send_telegram_msg(
-        f"❌ Bot run FAILED at {_ist_now().strftime('%H:%M')} IST "
-        f"({mode}/{action}): {detail[:300]}"
+        f"{icon} Bot run FAILED at {_ist_now().strftime('%H:%M')} IST "
+        f"({mode}/{action}){suffix}: {detail[:300]}",
+        photo="failure.png",
     )
 
 
 if __name__ == "__main__":
     try:
         run()
-    except AutomationError as exc:
-        log.error("Run failed: %s", exc)
-        _notify_failure(str(exc))
-        sys.exit(1)
-    except Exception as exc:  # noqa: BLE001 - want the traceback in CI logs
-        log.exception("Unexpected error.")
-        _notify_failure(f"{type(exc).__name__}: {exc}")
-        sys.exit(1)
+    except Exception as exc:
+        code = classify_exit_code(exc)
+        if isinstance(exc, AutomationError):
+            log.error("Run failed: %s", exc)
+            detail = str(exc)
+        else:
+            log.exception("Unexpected error.")
+            detail = f"{type(exc).__name__}: {exc}"
+        log.error(
+            "Exiting %d (%s).", code,
+            "transient, retryable" if code == EXIT_TRANSIENT else "permanent",
+        )
+        _notify_failure(detail, retryable=code == EXIT_TRANSIENT)
+        sys.exit(code)

@@ -119,6 +119,37 @@ Server-Sent Events feed for the console terminal. `?action=&runId=` scope the st
 - `POST` — `{ "method": "PIN", "pin": "1234" }` mints a 5-minute httpOnly unlock cookie. `{ "method": "WEBAUTHN" }` only *renews* an unlock a PIN already granted.
 - `DELETE` — locks immediately.
 
+## Bot resilience
+
+The Playwright bot (`bot/bot.py`) hardens four failure modes that only surface in headless CI:
+
+- **Blocking overlays.** `dismiss_modals()` runs after sign-in and again immediately before the punch click. It answers the "At Office / Work From Home" work-policy prompt (clicking the *office* option) and closes announcement/survey dialogs, looping up to 3 rounds because Zoho stacks them. A denylist prevents it from ever clicking Sign out / Delete. On a clean page it costs ~0.2 s and clicks nothing.
+- **Network interception over DOM scraping.** An `AttendanceInterceptor` listens on `page.on("response")` for JSON whose URL matches `attendance|checkin|punch|timetracker|…` and deep-scans the payload for duration and status fields. This is the primary source for elapsed time; scraping `#totalInTime` is now the fallback, so a Zoho CSS change degrades instead of breaking. The snapshot logs which source it used (`[api]` / `[dom]`).
+  - **The 9.5 h guard stays conservative:** when both sources produce a number, `verify_checkout_eligibility` uses the **smaller** one. Under-reading costs a retry; over-reading would punch out early.
+- **Tracing.** `TRACE=on` (default in CI, off locally) records `trace.zip` with DOM snapshots, network calls, and console logs, uploaded as a workflow artifact for 14 days. Replay a failed 9 AM run with `playwright show-trace trace.zip`. `TRACE=failure` keeps it only on failure.
+- **Headless detection.** `playwright-stealth` masks `navigator.webdriver`, plugin/codec lists, and the chrome runtime object; the context also pins `en-IN` / `Asia/Kolkata` to match the geolocation already being spoofed. The dependency is **optional at runtime** — an import failure logs a warning and the run continues unmasked rather than skipping a punch. Set `STEALTH=false` to disable.
+  - If GitHub's datacenter ranges ever get blocked, set the `PROXY_SERVER` (+ `PROXY_USERNAME` / `PROXY_PASSWORD`) repo secrets to route browser traffic through a residential proxy. Unset = direct connection; only the proxy *host* is logged.
+
+### Session reuse
+
+After a successful landing the bot saves the browser's `storage_state` and reuses it next run, going straight to the dashboard and **skipping password and OTP entirely**. Zoho sessions typically live 7–30 days; stale or rejected state is discarded automatically and the run falls back to a normal sign-in, so the worst case is what happens today.
+
+> **Security — this repo is public.** Session cookies are login-equivalent: whoever holds them is signed in as you, no OTP required. Actions cache entries on a public repo are readable by workflows from forked PRs, so the state blob is **encrypted with `STATE_KEY`** (a repo secret, which forked PRs never receive) before it is cached. **Without `STATE_KEY` the bot refuses to persist a session in CI at all** and just signs in with an OTP every run. Generate a key with:
+>
+> ```bash
+> python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+> ```
+>
+> Making the repo private would be the stronger fix; the encryption is what makes it defensible while it is public. Rotating `STATE_KEY` invalidates the stored session (the next run signs in normally), so it is safe to rotate at any time.
+
+Set `SESSION_REUSE=false` to force a full OTP sign-in, or `STATE_MAX_AGE_DAYS` to expire state sooner than the 7-day default.
+
+### Failure handling
+
+- **Exit codes drive retries.** `0` success, `1` permanent, `75` transient. The workflow retries **only on 75** — DNS, proxy, runner network drops, or a late OTP mail — once, after a 5-minute backoff. A 9.5 h safety abort or a bad credential exits `1` and stops immediately; retrying those would just hammer Zoho's abuse filters. Retrying after a punch that already landed is safe, because the idempotency check re-reads the widget and skips the duplicate.
+- **Telegram gets the screenshot.** Success and failure notifications use `sendPhoto` with `success.png` / `failure.png` attached, so you see what the bot saw without opening the CI logs. Built on stdlib multipart — no `requests` dependency. If the photo can't be sent for any reason it falls back to a text message rather than dropping the alert.
+- **Locators survive obfuscation.** `_punch_button` tries seven strategies in order — exact ARIA role, fuzzy role (`Check In` / `CheckIn` / `check_in`), `aria-label`, legacy IDs, any clickable element with matching text, layout-relative (`:near(:text("Attendance"))`), then bare text. All strategies are polled with `count()` rather than blocking waits, so the whole sweep completes in well under a second on a hit and is bounded at 15 s on a miss. Word-boundary anchoring stops `Check-in` matching `Checking`, and the in/out directions never cross.
+
 ## Behaviour notes
 
 - **Master automation toggle** writes `enabled` across all five weekday rows — `schedule_config.enabled` is the single source of truth the cron driver reads. There is no separate global flag to drift out of sync.

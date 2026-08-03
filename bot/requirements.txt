@@ -1,5 +1,16 @@
 playwright==1.48.0
 python-dotenv==1.0.1
 
+# Masks headless fingerprints (navigator.webdriver, plugin/codec lists, chrome
+# runtime object). Optional at runtime: bot.py logs a warning and continues
+# unmasked if the import fails, so a yank or API change cannot break a punch.
+playwright-stealth>=1.0.6,<3
+
+# Fernet encryption for the saved Zoho session (state/zoho_state.enc, written
+# relative to the repo root because that is where the bot is invoked from).
+# Session cookies are login-equivalent, and this repo is public, so the state
+# blob is never written unencrypted in CI. See "Session reuse" in the README.
+cryptography>=42,<51
+
 # Mail is read over IMAP with the stdlib (imaplib + email), so there is no
 # HTTP or auth-library dependency for the OTP step.

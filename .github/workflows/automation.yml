@@ -1,19 +1,10 @@
 name: Automation
 
-# Monorepo layout: the Python bot lives in bot/, the Next.js dashboard at the
-# repo root. Every path below is relative to the repo root, so the bot/ prefix
-# is required.
-
 on:
   schedule:
-    # GitHub cron is always UTC and may be delayed under load.
     - cron: '49 3 * * 1-5'  # 9:19 AM IST (Monday-Friday)
     - cron: '47 13 * * 1-5' # 7:17 PM IST (Monday-Friday)
   workflow_dispatch:
-    # These inputs mirror exactly what the dashboard sends in
-    # lib/github.ts -> dispatchGitHub(). workflow_dispatch rejects the whole
-    # call with 422 "Unexpected inputs provided" if an input is not declared
-    # here, so this list and that payload must stay in step.
     inputs:
       mode:
         description: "PUNCH (check in/out) or STATUS_CHECK (read the widget only)"
@@ -52,8 +43,6 @@ on:
         required: false
         type: string
 
-# One punch run at a time. Status checks get their own lane so a read-only
-# look at the widget can never sit behind — or delay — an actual punch.
 concurrency:
   group: automation-${{ inputs.mode || 'PUNCH' }}
   cancel-in-progress: false
@@ -67,44 +56,35 @@ jobs:
     timeout-minutes: 45
 
     env:
-      # Zoho People credentials, from repo secrets.
       ZOHO_EMAIL: ${{ secrets.ZOHO_EMAIL }}
       ZOHO_PASSWORD: ${{ secrets.ZOHO_PASSWORD }}
-      # Gmail IMAP: address + 16-char app password, both from repo secrets.
       GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
       FORM_URL: ${{ inputs.form_url }}
       HEADLESS: "true"
       PYTHONUNBUFFERED: "1"
-      # Passed through for logging/correlation with the dashboard's log row.
-      # The bot only self-jitters on `schedule` runs, so a manual dispatch that
-      # already waited out its delay in the browser does not wait twice.
-      # STATUS_CHECK signs in, reads the attendance widget, reports it to the
-      # dashboard and stops — it never clicks the punch button.
       DISPATCH_MODE: ${{ inputs.mode }}
       DISPATCH_ACTION: ${{ inputs.action }}
       DISPATCH_RUN_ID: ${{ inputs.run_id }}
       DISPATCH_SOURCE: ${{ inputs.source }}
       DISPATCH_DELAY_MS: ${{ inputs.delay_ms }}
       DISPATCH_BYPASS_DELAY: ${{ inputs.bypass_delay }}
-
-      # --- Dashboard as the source of truth ---
-      # Base URL of the deployed console, e.g. https://main.xxxx.amplifyapp.com
-      # On a scheduled run the bot asks it two questions before doing anything:
-      # is today a holiday exception, and is this weekday still enabled. There
-      # is deliberately no SKIP_DATES secret — the holiday_exceptions table and
-      # the schedule matrix already answer both, and a second copy here would
-      # drift from what the calendar UI shows.
-      # Unset = the bot skips the check and runs (fails open, logs loudly).
       CONTROL_CENTER_URL: ${{ secrets.CONTROL_CENTER_URL }}
-      # Sent as a bearer token on those reads. The endpoints are open today;
-      # this is already correct if they are ever locked down.
       DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
-
-      # --- Optional: Telegram run notifications ---
-      # Both must be set for delivery; unset means notifications are simply off.
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TRACE: "on"
+      STEALTH: "true"
+      # Fernet key encrypting the saved Zoho session. Session cookies are
+      # login-equivalent and Actions caches on a PUBLIC repo are readable by
+      # forked-PR workflows, so without this secret the bot refuses to persist
+      # a session at all and just signs in with an OTP every run.
+      STATE_KEY: ${{ secrets.STATE_KEY }}
+      # Optional: set these repository secrets only if GitHub's datacenter IPs
+      # start getting blocked. Empty values are ignored by the bot.
+      PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+      PROXY_USERNAME: ${{ secrets.PROXY_USERNAME }}
+      PROXY_PASSWORD: ${{ secrets.PROXY_PASSWORD }}
 
     steps:
       - name: Check out repository
@@ -122,7 +102,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r bot/requirements.txt
 
-      # Cache the browser binaries; the key tracks the pinned Playwright version.
       - name: Cache Playwright browsers
         id: playwright-cache
         uses: actions/cache@v4
@@ -133,14 +112,49 @@ jobs:
       - name: Install Playwright browsers and system dependencies
         run: playwright install --with-deps chromium
 
-      # Run from the repo root so the bot's cwd-relative paths (.env lookup and
-      # failure.png) resolve where the upload step below expects them.
-      - name: Run Playwright bot
-        run: python bot/bot.py
+      # Carries the encrypted Zoho session between runs so we do not burn an OTP
+      # every time. The run_id key forces a fresh save each run while the prefix
+      # restore-key picks up the most recent previous one (mutable-cache idiom).
+      # The blob is useless without the STATE_KEY secret, which forked-PR
+      # workflows never receive.
+      - name: Restore saved Zoho session
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: zoho-session-${{ github.run_id }}
+          restore-keys: |
+            zoho-session-
 
-      # `always()`, not `failure()`: success.png only exists when the run
-      # succeeded, so a failure-only condition could never upload it. This also
-      # keeps the evidence for a cancelled or timed-out run.
+      # Retries ONLY on exit 75 (EX_TEMPFAIL): DNS, proxy, runner network, or a
+      # late OTP mail. A 9.5h safety abort or a bad credential exits 1 and stops
+      # immediately - retrying those would just hammer Zoho's abuse filters.
+      # A retry after a punch that already landed is safe: the bot re-reads the
+      # widget and skips the duplicate.
+      - name: Run Playwright bot
+        run: |
+          set +e
+          attempt=1
+          max_attempts=2
+          backoff=300
+          while : ; do
+            python bot/bot.py
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$code" -ne 75 ]; then
+              echo "::error::Bot failed with exit code $code (permanent) - not retrying."
+              exit "$code"
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::Transient failure persisted across $attempt attempts."
+              exit "$code"
+            fi
+            echo "::warning::Transient failure on attempt $attempt; retrying in ${backoff}s."
+            attempt=$((attempt + 1))
+            sleep "$backoff"
+          done
+
       - name: Upload screenshots
         if: always()
         uses: actions/upload-artifact@v4
@@ -151,3 +165,14 @@ jobs:
             success.png
           if-no-files-found: ignore
           retention-days: 7
+
+      # Step-by-step replay of the headless session: DOM snapshots, network
+      # calls, console logs. Download and open with `playwright show-trace trace.zip`.
+      - name: Upload Playwright trace
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-trace-${{ github.run_id }}-${{ github.run_attempt }}
+          path: trace.zip
+          if-no-files-found: ignore
+          retention-days: 14
