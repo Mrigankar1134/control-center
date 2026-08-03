@@ -33,6 +33,9 @@ venv/
 /trace.zip
 # Saved Zoho session cookies - login-equivalent, never commit these.
 /state/
+bot/encrypted_state.enc
+bot/plain_state.json
+bot/_active_state.json
 playwright-report/
 test-results/
 !public/**/*.png

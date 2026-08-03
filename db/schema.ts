@@ -111,6 +111,74 @@ export const auditLog = pgTable("audit_log", {
   details: jsonb("details"),
 });
 
+// ---------------------------------------------------------------------------
+// Neural Control core tables
+// ---------------------------------------------------------------------------
+//
+// These three carry the canonical shape of the system: one row per weekday, one
+// row per suppressed date, one row per bot run. They sit alongside the older
+// `schedule_config` / `holiday_exceptions` / `dispatch_logs` tables, which are
+// still read by the existing /api routes and hold the deployed Neon data.
+
+export const runSourceEnum = pgEnum("run_source", ["CRON", "MANUAL"]);
+
+export const runActionEnum = pgEnum("run_action", ["Check-in", "Check-out"]);
+
+export const runStatusEnum = pgEnum("run_status", [
+  "QUEUED",
+  "RUNNING",
+  "SUCCESS",
+  "SKIPPED",
+  "FAILED",
+]);
+
+/** One row per weekday. `dayOfWeek` is unique, so upserts key cleanly off it. */
+export const schedules = pgTable("schedules", {
+  id: serial("id").primaryKey(),
+  dayOfWeek: dayOfWeekEnum("day_of_week").notNull().unique(),
+  enabled: boolean("enabled").default(true).notNull(),
+  /** Jitter ceiling in minutes; the bot picks uniformly from [0, this]. */
+  randomOffsetMinutes: integer("random_offset_minutes").default(25).notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().notNull(),
+});
+
+/** Calendar dates on which no scheduled window may fire. */
+export const exceptions = pgTable("exceptions", {
+  id: serial("id").primaryKey(),
+  exceptionDate: date("exception_date").notNull().unique(), // YYYY-MM-DD
+  reason: text("reason").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+/**
+ * One row per bot run. `runId` correlates the dashboard's dispatch with the
+ * GitHub Actions run and with whatever the bot reported back afterwards.
+ *
+ * `loggedSeconds` / `rawTime` are the attendance figures as Zoho presented
+ * them, kept verbatim so a disputed punch can be reconstructed.
+ */
+export const runLogs = pgTable("run_logs", {
+  id: serial("id").primaryKey(),
+  runId: text("run_id").notNull(),
+  source: runSourceEnum("source").notNull(),
+  action: runActionEnum("action"),
+  status: runStatusEnum("status").notNull(),
+  loggedSeconds: integer("logged_seconds"),
+  rawTime: text("raw_time"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export type Schedule = typeof schedules.$inferSelect;
+export type NewSchedule = typeof schedules.$inferInsert;
+export type Exception = typeof exceptions.$inferSelect;
+export type NewException = typeof exceptions.$inferInsert;
+export type RunLog = typeof runLogs.$inferSelect;
+export type NewRunLog = typeof runLogs.$inferInsert;
+
+export type RunSource = (typeof runSourceEnum.enumValues)[number];
+export type RunAction = (typeof runActionEnum.enumValues)[number];
+export type RunStatus = (typeof runStatusEnum.enumValues)[number];
+
 export type ScheduleConfig = typeof scheduleConfig.$inferSelect;
 export type NewScheduleConfig = typeof scheduleConfig.$inferInsert;
 export type DispatchLog = typeof dispatchLogs.$inferSelect;

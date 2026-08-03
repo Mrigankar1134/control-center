@@ -367,7 +367,7 @@ MODAL_DISMISS_BUTTONS = [
 # or change account security settings.
 MODAL_CLICK_DENYLIST = re.compile(
     r"sign\s*out|log\s*out|delete|cancel\s+check|"
-    r"enable\s+mfa|change\s+configuration|security\s+key|authenticator",
+    r"enable\s+mfa|verify|change\s+configuration|security\s+key|authenticator",
     re.I,
 )
 
@@ -496,6 +496,12 @@ def dismiss_modals(page: Page, rounds: int = 3) -> int:
     stacks a survey behind an announcement.
     """
     dismissed = 0
+
+    # Zoho's MFA interstitial is a full page, not an overlay, and the only safe
+    # control on it is "Remind in 2 weeks" - see defer_mfa_prompt, which
+    # re-checks the label against MFA_NEVER_CLICK before touching anything.
+    if mfa_prompt_visible(page) and defer_mfa_prompt(page):
+        dismissed += 1
 
     for attempt in range(rounds):
         clicked = False
@@ -714,9 +720,9 @@ def _await_otp_or_dashboard(page: Page, timeout: int = 45_000):
 # cache entries on a PUBLIC repo are readable by workflows from forked PRs.
 # Without STATE_KEY we refuse to persist in CI at all. See README.
 
-STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
-STATE_BLOB = STATE_DIR / "zoho_state.enc"       # what CI caches (encrypted)
-STATE_PLAIN = STATE_DIR / "zoho_state.json"     # local-only convenience
+STATE_DIR = Path(os.getenv("STATE_DIR", "bot"))
+STATE_BLOB = STATE_DIR / "encrypted_state.enc"  # what CI caches (encrypted)
+STATE_PLAIN = STATE_DIR / "plain_state.json"    # local-only convenience
 STATE_MAX_AGE_DAYS = float(os.getenv("STATE_MAX_AGE_DAYS", "7"))
 
 

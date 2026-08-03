@@ -44,7 +44,7 @@ on:
         type: string
 
 concurrency:
-  group: automation-${{ inputs.mode || 'PUNCH' }}
+  group: automation-queue
   cancel-in-progress: false
 
 permissions:
@@ -53,9 +53,9 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # Generous because the evening run may hold the job open waiting to reach
-    # 9.5h (MAX_CHECKOUT_WAIT_MIN, default 40) before it checks out.
-    timeout-minutes: 75
+    # 60 = the 40-minute hold-open budget (MAX_CHECKOUT_WAIT_MIN) plus the run
+    # itself, the 5-minute transient backoff, and headroom.
+    timeout-minutes: 60
 
     env:
       ZOHO_EMAIL: ${{ secrets.ZOHO_EMAIL }}
@@ -128,10 +128,10 @@ jobs:
       - name: Restore saved Zoho session
         uses: actions/cache@v4
         with:
-          path: state
-          key: zoho-session-${{ github.run_id }}
+          path: bot/encrypted_state.enc
+          key: session-state-${{ github.run_id }}
           restore-keys: |
-            zoho-session-
+            session-state-
 
       # Retries ONLY on exit 75 (EX_TEMPFAIL): DNS, proxy, runner network, or a
       # late OTP mail. A 9.5h safety abort or a bad credential exits 1 and stops
@@ -163,24 +163,16 @@ jobs:
             sleep "$backoff"
           done
 
-      - name: Upload screenshots
-        if: always()
+      # Failure-only: the screenshot already reaches the phone over Telegram on
+      # every run, and a ~14 MB trace per successful run is pure noise.
+      # `playwright show-trace trace.zip` replays the whole headless session.
+      - name: Upload failure diagnostics
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-screenshots
+          name: failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
+            trace.zip
             failure.png
-            success.png
-          if-no-files-found: ignore
-          retention-days: 7
-
-      # Step-by-step replay of the headless session: DOM snapshots, network
-      # calls, console logs. Download and open with `playwright show-trace trace.zip`.
-      - name: Upload Playwright trace
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-trace-${{ github.run_id }}-${{ github.run_attempt }}
-          path: trace.zip
           if-no-files-found: ignore
           retention-days: 14
