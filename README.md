@@ -144,9 +144,26 @@ After a successful landing the bot saves the browser's `storage_state` and reuse
 
 Set `SESSION_REUSE=false` to force a full OTP sign-in, or `STATE_MAX_AGE_DAYS` to expire state sooner than the 7-day default.
 
+### Attendance policy
+
+The shift is **not** a fixed 09:00–18:30. The rules the bot enforces are:
+
+| Rule | Value |
+| --- | --- |
+| Check in after | `CHECKIN_EARLIEST` — 08:00 |
+| Check in before | `CHECKIN_LATEST` — 10:30 |
+| Check out by | `CHECKOUT_DEADLINE` — 20:00 |
+| Zoho total required | 9 h 30 m (`REQUIRED_MINUTES`) |
+
+Zoho inserts a **30-minute lunch break automatically** and counts it *inside* that total, so 9 h 30 m on the widget is 9 h of actual work. The threshold is deliberately measured against Zoho's own total, not against a computed work figure.
+
+Before 08:00 the bot stands down. Past 10:30 it still checks in — late attendance beats none — but warns on Telegram that 9.5 h will now finish after the 20:00 deadline.
+
+**The evening cron is a fixed time; eligibility is not.** Check in at 10:04 and 9.5 h lands at 19:34, after the 19:17 window. Rather than abandoning the check-out, the bot **waits up to `MAX_CHECKOUT_WAIT_MIN` (40)** for the requirement to be met, provided that lands before the deadline — then reloads, re-reads, and re-verifies before punching. If the shortfall is larger than the budget or would cross 20:00, it aborts and tells you on Telegram exactly how many minutes are missing. The job timeout is 75 minutes to accommodate that wait.
+
 ### Deciding what to punch
 
-Intent comes from the dispatched action, or on a cron run from the **time of day in IST** (before 14:00 → Check-in). Status is only ever used to *veto* a punch, never to choose one:
+Intent comes from the dispatched action, then from **which cron fired** (`github.event.schedule`), and only failing both from the time of day. Using the cron window matters: a 09:19 schedule is a check-in *even when GitHub starts it at 12:31*. Status is only ever used to *veto* a punch, never to choose one:
 
 | Time | Status | Result |
 | --- | --- | --- |
@@ -156,7 +173,9 @@ Intent comes from the dispatched action, or on a cron run from the **time of day
 | Evening | `Out` | skip — duplicate |
 | Evening | `Yet to Check-in`, `Absent` | skip — nothing to check out of |
 
-`classify_status()` matches on word boundaries in a fixed order rather than testing substrings. This matters: **`"Yet to Check-in"` contains `"in"` and no `"out"`**, so the previous substring test read *not checked in* as *checked in* and would have aimed a morning cron at Check-out. Cron runs pass no `DISPATCH_ACTION`, so that was the live path. The 9.5 h guard would have caught it, but as a hard failure rather than a punch.
+`classify_status()` matches on word boundaries in a fixed order rather than testing substrings. This matters: **`"Yet to Check-in"` contains `"in"` and no `"out"`**, so the previous substring test read *not checked in* as *checked in*.
+
+This is the mechanism behind the 12:31 check-out on 3 Aug 2026, and it is worth being precise about, because the trigger was the **morning** cron. The old code chose the action from the *status* before considering anything else: it ran late, saw `In` (checked in at 10:04), and applied "if checked in, check out" — so a 09:19 check-in window produced a check-out. Intent is now taken from the cron window, and status can only veto.
 
 ### The MFA interstitial
 

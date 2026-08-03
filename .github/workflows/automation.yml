@@ -53,7 +53,9 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Generous because the evening run may hold the job open waiting to reach
+    # 9.5h (MAX_CHECKOUT_WAIT_MIN, default 40) before it checks out.
+    timeout-minutes: 75
 
     env:
       ZOHO_EMAIL: ${{ secrets.ZOHO_EMAIL }}

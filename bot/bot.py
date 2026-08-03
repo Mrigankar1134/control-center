@@ -1426,12 +1426,77 @@ def verify_checkout_eligibility(page: Page) -> None:
     total_minutes = effective_seconds // 60
     hours, minutes = divmod(total_minutes, 60)
 
-    if total_minutes < REQUIRED_MINUTES:
+    if total_minutes >= REQUIRED_MINUTES:
+        log.info("Safety check passed: 9.5 hour requirement met (%dh %dm).", hours, minutes)
+        return
+
+    shortfall = REQUIRED_MINUTES - total_minutes
+    now = _ist_now()
+    eligible_at = now + timedelta(minutes=shortfall)
+    deadline = _ist_at(CHECKOUT_DEADLINE)
+
+    # The evening cron is a fixed time, but eligibility depends on when you
+    # actually checked in. Check in at 10:04 and 9.5h lands at 19:34, after the
+    # 19:17 window - so wait it out rather than abandoning the check-out.
+    can_wait = shortfall <= MAX_CHECKOUT_WAIT_MIN and eligible_at <= deadline
+
+    if not can_wait:
+        reason = (
+            f"that is {shortfall - MAX_CHECKOUT_WAIT_MIN:.0f} min beyond the "
+            f"{MAX_CHECKOUT_WAIT_MIN} min the job can wait"
+            if shortfall > MAX_CHECKOUT_WAIT_MIN
+            else f"which is past the {CHECKOUT_DEADLINE} deadline"
+        )
+        send_telegram_msg(
+            f"🚫 Not checking out: only {hours}h {minutes}m logged, 9.5h needs "
+            f"{shortfall} more minutes (eligible {eligible_at.strftime('%H:%M')} IST) - "
+            f"{reason}. Check out manually when you are ready."
+        )
         raise AutomationError(
             f"SAFETY ABORT: Attempting to check out too early. "
-            f"Only {hours}h {minutes}m elapsed. 9.5 hours ({REQUIRED_MINUTES}m) required."
+            f"Only {hours}h {minutes}m elapsed. 9.5 hours ({REQUIRED_MINUTES}m) required. "
+            f"Eligible at {eligible_at.strftime('%H:%M')} IST - {reason}."
         )
-    log.info("Safety check passed: 9.5 hour requirement met.")
+
+    log.info(
+        "Short by %d min. Waiting until %s IST (deadline %s) before checking out.",
+        shortfall, eligible_at.strftime("%H:%M"), CHECKOUT_DEADLINE,
+    )
+    send_telegram_msg(
+        f"⏳ Holding the check-out: {hours}h {minutes}m logged, waiting "
+        f"{shortfall} min until 9.5h at {eligible_at.strftime('%H:%M')} IST."
+    )
+
+    # +1 min of slack so a rounding-down read does not put us back under.
+    page.wait_for_timeout(int((shortfall + 1) * 60_000))
+
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=45_000)
+        page.wait_for_timeout(3_000)
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        raise TransientError(f"Could not refresh the page after waiting: {exc}") from exc
+
+    dismiss_modals(page, rounds=2)
+    recheck = read_attendance(page)
+    if recheck.seconds is None:
+        raise AutomationError(
+            "SAFETY ABORT: elapsed time became unreadable after waiting; not checking out."
+        )
+
+    final_seconds = recheck.seconds
+    if recheck.dom_seconds is not None:
+        final_seconds = min(final_seconds, recheck.dom_seconds)
+
+    final_minutes = final_seconds // 60
+    if final_minutes < REQUIRED_MINUTES:
+        raise AutomationError(
+            f"SAFETY ABORT: still only {final_minutes // 60}h {final_minutes % 60}m "
+            f"after waiting. Not checking out."
+        )
+
+    log.info(
+        "Safety check passed after waiting: %dh %dm.", final_minutes // 60, final_minutes % 60
+    )
 
 
 def run_status_check(page: Page) -> None:
@@ -1576,6 +1641,43 @@ def classify_status(status: Optional[str]) -> str:
 # The crons fire at 09:19 and 19:17 IST, so the boundary is nowhere near either.
 MORNING_CUTOFF_HOUR = 14
 
+# --- Attendance policy -----------------------------------------------------
+# Check in between 08:00 and 10:30, check out by 20:00, and Zoho must show
+# 9.5 hours. The 30-minute lunch break is inserted automatically by Zoho and is
+# counted inside that 9.5, so 9.5 total = 9 hours of actual work. The shift is
+# not fixed at 09:00-18:30; only the windows below matter.
+CHECKIN_EARLIEST = os.getenv("CHECKIN_EARLIEST", "08:00")
+CHECKIN_LATEST = os.getenv("CHECKIN_LATEST", "10:30")
+CHECKOUT_DEADLINE = os.getenv("CHECKOUT_DEADLINE", "20:00")
+# How long the bot may hold the job open waiting to become eligible.
+MAX_CHECKOUT_WAIT_MIN = int(os.getenv("MAX_CHECKOUT_WAIT_MIN", "40"))
+
+
+def _ist_at(hhmm: str) -> datetime:
+    """Today's IST datetime for an "HH:MM" string."""
+    hour, _, minute = hhmm.partition(":")
+    return _ist_now().replace(
+        hour=int(hour), minute=int(minute or 0), second=0, microsecond=0
+    )
+
+
+def _intent_from_cron() -> Optional[str]:
+    """
+    Which punch the firing cron was for.
+
+    Stronger than reading the wall clock: a 09:19 window is a check-in even if
+    GitHub starts it late. This is precisely what went wrong on 3 Aug - the
+    morning cron ran at 12:31 and the old logic, which chose from the *status*
+    rather than from the schedule, turned it into a check-out.
+    """
+    expression = (os.getenv("SCHEDULED_CRON") or "").strip()
+    if not expression:
+        return None
+    target = _cron_target_utc(expression, datetime.now(timezone.utc))
+    if target is None:
+        return None
+    return "Check-in" if target.astimezone(IST).hour < MORNING_CUTOFF_HOUR else "Check-out"
+
 
 def decide_punch(snapshot: AttendanceSnapshot) -> tuple[Optional[str], Optional[str]]:
     """
@@ -1589,14 +1691,18 @@ def decide_punch(snapshot: AttendanceSnapshot) -> tuple[Optional[str], Optional[
     dashboard_action = os.environ.get("DISPATCH_ACTION")
     state = classify_status(snapshot.status)
 
+    cron_intent = _intent_from_cron()
+
     if dashboard_action == "ACTION_ALPHA":
         target, origin = "Check-in", "dispatched ACTION_ALPHA"
     elif dashboard_action == "ACTION_BETA":
         target, origin = "Check-out", "dispatched ACTION_BETA"
+    elif cron_intent is not None:
+        # The schedule that fired decides, not the clock when it happened to run.
+        target, origin = cron_intent, f"cron window ({os.getenv('SCHEDULED_CRON')})"
     else:
         hour = _ist_now().hour
-        morning = hour < MORNING_CUTOFF_HOUR
-        target = "Check-in" if morning else "Check-out"
+        target = "Check-in" if hour < MORNING_CUTOFF_HOUR else "Check-out"
         origin = f"time of day ({hour:02d}:xx IST)"
 
     log.info(
@@ -1606,6 +1712,29 @@ def decide_punch(snapshot: AttendanceSnapshot) -> tuple[Optional[str], Optional[
 
     if target == "Check-in" and state == STATE_IN:
         return None, "already checked in"
+
+    if target == "Check-in":
+        now = _ist_now()
+        if now < _ist_at(CHECKIN_EARLIEST):
+            return None, (
+                f"it is before the {CHECKIN_EARLIEST} check-in window "
+                f"(now {now.strftime('%H:%M')} IST)"
+            )
+        if now > _ist_at(CHECKIN_LATEST):
+            # Late attendance still beats none, so punch - but say so loudly,
+            # because 9.5h from here finishes after the check-out deadline.
+            finish = (now + timedelta(minutes=REQUIRED_MINUTES)).strftime("%H:%M")
+            log.warning(
+                "Checking in at %s, past the %s window. 9.5h completes at %s, "
+                "after the %s deadline.",
+                now.strftime("%H:%M"), CHECKIN_LATEST, finish, CHECKOUT_DEADLINE,
+            )
+            _warn_once(
+                "late-checkin",
+                f"⚠️ Checking in at {now.strftime('%H:%M')} IST, past the "
+                f"{CHECKIN_LATEST} window. 9.5h would complete at {finish}, after "
+                f"the {CHECKOUT_DEADLINE} check-out deadline.",
+            )
 
     if target == "Check-out":
         if state == STATE_OUT:
