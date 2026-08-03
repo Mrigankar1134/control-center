@@ -1072,27 +1072,51 @@ def _walk_payload(node, depth: int = 0):
             yield from _walk_payload(item, depth + 1)
 
 
-def extract_attendance_from_payload(payload) -> tuple[Optional[int], Optional[str], Optional[str]]:
+def duration_candidates(payload) -> list[tuple[str, int, object]]:
     """
-    Pull (seconds, raw, status) out of a decoded JSON attendance response.
+    Every (key, seconds, raw_value) in the payload that looks like a duration.
 
-    Returns (None, None, None) when the payload carries nothing usable, which is
-    the common case - most intercepted responses are unrelated.
+    More than one usually matches, and they do not all mean the same thing -
+    Zoho's `totalSecs` counts only *closed* punch pairs, so while a session is
+    still running it under-reports the day by the length of that session. The
+    full list is logged so a wrong pick can be diagnosed from one run's output
+    instead of by guessing at the schema.
+    """
+    found: list[tuple[str, int, object]] = []
+    seen: set[str] = set()
+    for key, value in _walk_payload(payload):
+        if not isinstance(key, str) or key in seen or not _DURATION_KEY.search(key):
+            continue
+        candidate = _duration_to_seconds(value)
+        if candidate is not None:
+            seen.add(key)
+            found.append((key, candidate, value))
+    return found
+
+
+def extract_attendance_from_payload(
+    payload,
+) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
+    """
+    Pull (seconds, raw, status, duration_key) out of a decoded JSON attendance
+    response.
+
+    Returns all-None when the payload carries nothing usable, which is the
+    common case - most intercepted responses are unrelated.
     """
     seconds: Optional[int] = None
     raw: Optional[str] = None
     status: Optional[str] = None
+    duration_key: Optional[str] = None
+
+    candidates = duration_candidates(payload)
+    if candidates:
+        duration_key, seconds, value = candidates[0]
+        raw = value if isinstance(value, str) else None
 
     for key, value in _walk_payload(payload):
         if not isinstance(key, str):
             continue
-
-        if seconds is None and _DURATION_KEY.search(key):
-            candidate = _duration_to_seconds(value)
-            if candidate is not None:
-                seconds = candidate
-                raw = value if isinstance(value, str) else None
-                log.debug("Duration from payload key %r = %r", key, value)
 
         if (
             status is None
@@ -1107,7 +1131,7 @@ def extract_attendance_from_payload(payload) -> tuple[Optional[int], Optional[st
         hours, remainder = divmod(seconds, 3600)
         raw = f"{hours:02d}:{remainder // 60:02d}:{remainder % 60:02d}"
 
-    return seconds, raw, status
+    return seconds, raw, status, duration_key
 
 
 def _payload_key_names(payload, limit: int = 60) -> list[str]:
@@ -1158,7 +1182,8 @@ class AttendanceInterceptor:
         self.seen_urls.append(url.split("?")[0][:160])
 
         try:
-            seconds, raw, status = extract_attendance_from_payload(payload)
+            seconds, raw, status, duration_key = extract_attendance_from_payload(payload)
+            candidates = duration_candidates(payload)
         except Exception as exc:
             log.debug("Payload parse failed for %s: %s", url[:120], exc)
             return
@@ -1172,11 +1197,17 @@ class AttendanceInterceptor:
         if status is not None:
             self.status = status
         log.info(
-            "Intercepted attendance payload from %s (seconds=%s, status=%s)",
+            "Intercepted attendance payload from %s (seconds=%s from %r, status=%s)",
             url.split("?")[0][-60:],
             seconds,
+            duration_key,
             status,
         )
+        if len(candidates) > 1:
+            log.info(
+                "Duration fields in payload: %s",
+                ", ".join(f"{key}={secs}s" for key, secs, _ in candidates),
+            )
 
         # When half the payload parsed, print the key names (never the values -
         # these responses carry employee data) so the missing pattern can be
@@ -1225,9 +1256,20 @@ class AttendanceSnapshot:
         self.raw = raw
         self.settled = settled
         self.origin = origin  # "api" (intercepted XHR) or "dom" (scraped widget)
-        # Set on merged snapshots so the checkout guard can take the
-        # conservative reading when API and DOM disagree.
+        # Both raw readings are kept on merged snapshots. `seconds` above is the
+        # one worth reporting; the checkout guard separately takes the smallest
+        # of these, so a disagreement can never punch out early.
         self.dom_seconds: Optional[int] = None
+        self.api_seconds: Optional[int] = None
+
+    def guard_seconds(self) -> Optional[int]:
+        """Smallest elapsed reading available - what the 9.5h rule must use."""
+        readings = [
+            value
+            for value in (self.seconds, self.dom_seconds, self.api_seconds)
+            if value is not None
+        ]
+        return min(readings) if readings else None
 
     @property
     def minutes(self) -> Optional[int]:
@@ -1270,6 +1312,11 @@ def _parse_timer_spans(page: Page) -> tuple[Optional[int], Optional[str]]:
 
 WIDGET_SETTLE_TIMEOUT = 20
 
+# How far the API and DOM elapsed readings may drift before one is treated as
+# wrong rather than merely stale. A few minutes is normal clock lag between the
+# payload landing and the widget being scraped.
+DISAGREEMENT_TOLERANCE = 300
+
 
 def _read_attendance_once(page: Page) -> AttendanceSnapshot:
     status: Optional[str] = None
@@ -1299,38 +1346,51 @@ def read_attendance(page: Page) -> AttendanceSnapshot:
         page.wait_for_timeout(1_000)
         snapshot = _read_attendance_once(page)
 
-    # Prefer the intercepted API payload - it survives DOM changes. The DOM read
-    # above still runs because it is what forces the XHR to have happened, and
-    # it backfills whichever field the payload did not carry.
+    # Merge the intercepted API payload with the scraped widget. The API is the
+    # better default - it survives DOM changes, and it backfills whichever field
+    # the widget did not render - but it does not get to overrule a widget
+    # reading that plainly contradicts it. See the disagreement branch below.
     api = INTERCEPTOR.snapshot() if INTERCEPTOR is not None else None
     if api is not None:
-        merged = AttendanceSnapshot(
-            status=api.status or snapshot.status,
-            seconds=api.seconds if api.seconds is not None else snapshot.seconds,
-            raw=api.raw if api.seconds is not None else snapshot.raw,
-            settled=True,
-            origin="api" if api.seconds is not None else "api+dom",
-        )
-        if (
+        # On a real disagreement the widget wins: it is the number Zoho shows the
+        # employee, and it is the one that counts the still-running session. The
+        # API's day total omits the open punch pair, so it reads hours short
+        # while checked in - which is exactly when this runs.
+        disagrees = (
             snapshot.seconds is not None
             and api.seconds is not None
-            and abs(snapshot.seconds - api.seconds) > 300
-        ):
+            and abs(snapshot.seconds - api.seconds) > DISAGREEMENT_TOLERANCE
+        )
+        use_api_seconds = api.seconds is not None and not disagrees
+
+        merged = AttendanceSnapshot(
+            status=api.status or snapshot.status,
+            seconds=api.seconds if use_api_seconds else snapshot.seconds,
+            raw=api.raw if use_api_seconds else snapshot.raw,
+            settled=True,
+            origin="api" if use_api_seconds else "api+dom",
+        )
+        if disagrees:
             log.warning(
-                "API and DOM disagree on elapsed time (api=%ss, dom=%ss); trusting API.",
+                "API and DOM disagree on elapsed time (api=%ss, dom=%ss); "
+                "trusting DOM - the API total excludes the running session.",
                 api.seconds,
                 snapshot.seconds,
             )
         merged.dom_seconds = snapshot.seconds
+        merged.api_seconds = api.seconds
         # State both readings explicitly. The 9.5h guard depends on at least one
         # of them, so "which source actually produced a number" is the first
         # thing worth knowing when a check-out behaves oddly.
         log.info(
-            "Sources: api=%ss, dom=%s, status=%r (%s)",
+            "Sources: api=%ss, dom=%s, status=%r (%s); elapsed taken from %s, "
+            "9.5h guard uses %ss",
             api.seconds,
             f"{snapshot.seconds}s" if snapshot.seconds is not None else "unreadable",
             merged.status,
             "api" if api.status else "dom",
+            "api" if use_api_seconds else "dom",
+            merged.guard_seconds(),
         )
         snapshot = merged
     elif INTERCEPTOR is not None:
@@ -1427,11 +1487,7 @@ def verify_checkout_eligibility(page: Page) -> None:
 
     # When both the API payload and the widget produced a number, trust the
     # smaller one. Under-reading costs a retry; over-reading punches out early.
-    effective_seconds = snapshot.seconds
-    if snapshot.dom_seconds is not None:
-        effective_seconds = min(effective_seconds, snapshot.dom_seconds)
-
-    total_minutes = effective_seconds // 60
+    total_minutes = snapshot.guard_seconds() // 60
     hours, minutes = divmod(total_minutes, 60)
 
     if total_minutes >= REQUIRED_MINUTES:
@@ -1491,11 +1547,7 @@ def verify_checkout_eligibility(page: Page) -> None:
             "SAFETY ABORT: elapsed time became unreadable after waiting; not checking out."
         )
 
-    final_seconds = recheck.seconds
-    if recheck.dom_seconds is not None:
-        final_seconds = min(final_seconds, recheck.dom_seconds)
-
-    final_minutes = final_seconds // 60
+    final_minutes = recheck.guard_seconds() // 60
     if final_minutes < REQUIRED_MINUTES:
         raise AutomationError(
             f"SAFETY ABORT: still only {final_minutes // 60}h {final_minutes % 60}m "
