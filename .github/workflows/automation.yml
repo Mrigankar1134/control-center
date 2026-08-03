@@ -73,7 +73,10 @@ jobs:
       DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      TRACE: "on"
+      # "failure" keeps trace.zip only when a run fails. Interception and the
+      # locator ladder are confirmed working against live Zoho, so a ~14 MB
+      # artifact per successful run is noise. Flip back to "on" while debugging.
+      TRACE: "failure"
       STEALTH: "true"
       # Fernet key encrypting the saved Zoho session. Session cookies are
       # login-equivalent and Actions caches on a PUBLIC repo are readable by

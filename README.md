@@ -144,6 +144,20 @@ After a successful landing the bot saves the browser's `storage_state` and reuse
 
 Set `SESSION_REUSE=false` to force a full OTP sign-in, or `STATE_MAX_AGE_DAYS` to expire state sooner than the 7-day default.
 
+### Deciding what to punch
+
+Intent comes from the dispatched action, or on a cron run from the **time of day in IST** (before 14:00 → Check-in). Status is only ever used to *veto* a punch, never to choose one:
+
+| Time | Status | Result |
+| --- | --- | --- |
+| Morning | `Yet to Check-in`, `Out`, unknown | Check-in |
+| Morning | `Checked In` | skip — duplicate |
+| Evening | `Checked In`, unknown | Check-out |
+| Evening | `Out` | skip — duplicate |
+| Evening | `Yet to Check-in`, `Absent` | skip — nothing to check out of |
+
+`classify_status()` matches on word boundaries in a fixed order rather than testing substrings. This matters: **`"Yet to Check-in"` contains `"in"` and no `"out"`**, so the previous substring test read *not checked in* as *checked in* and would have aimed a morning cron at Check-out. Cron runs pass no `DISPATCH_ACTION`, so that was the live path. The 9.5 h guard would have caught it, but as a hard failure rather than a punch.
+
 ### Failure handling
 
 - **Exit codes drive retries.** `0` success, `1` permanent, `75` transient. The workflow retries **only on 75** — DNS, proxy, runner network drops, or a late OTP mail — once, after a 5-minute backoff. A 9.5 h safety abort or a bad credential exits `1` and stops immediately; retrying those would just hammer Zoho's abuse filters. Retrying after a punch that already landed is safe, because the idempotency check re-reads the widget and skips the duplicate.

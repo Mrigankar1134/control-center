@@ -882,7 +882,14 @@ ATTENDANCE_URL_HINT = re.compile(
 _DURATION_KEY = re.compile(
     r"(total|worked|elapsed|payable|present)[_a-z]*(time|hours?|hrs|duration|sec)", re.I
 )
-_STATUS_KEY = re.compile(r"^(att(endance)?_?)?status$|checkinstatus|punchstatus", re.I)
+_STATUS_KEY = re.compile(
+    r"^(att(endance)?_?)?status$|checkinstatus|punchstatus|"
+    r"emp(loyee)?status|currentstatus|att_?state|punchstate|"
+    r"^state$|statusmessage|status_?(text|label|str)",
+    re.I,
+)
+# Values that are a status code rather than a label ("0"/"1") tell us nothing.
+_STATUS_VALUE_OK = re.compile(r"[a-z]{2,}", re.I)
 _HHMM = re.compile(r"^(\d{1,3})[:hH](\d{1,2})(?:[:mM](\d{1,2}))?$")
 
 MAX_PAYLOAD_BYTES = 2_000_000
@@ -959,14 +966,31 @@ def extract_attendance_from_payload(payload) -> tuple[Optional[int], Optional[st
                 raw = value if isinstance(value, str) else None
                 log.debug("Duration from payload key %r = %r", key, value)
 
-        if status is None and _STATUS_KEY.search(key) and isinstance(value, str) and value.strip():
+        if (
+            status is None
+            and _STATUS_KEY.search(key)
+            and isinstance(value, str)
+            and _STATUS_VALUE_OK.search(value)
+        ):
             status = value.strip()
+            log.debug("Status from payload key %r = %r", key, value)
 
     if seconds is not None and not raw:
         hours, remainder = divmod(seconds, 3600)
         raw = f"{hours:02d}:{remainder // 60:02d}:{remainder % 60:02d}"
 
     return seconds, raw, status
+
+
+def _payload_key_names(payload, limit: int = 60) -> list[str]:
+    """Distinct key names in a payload, for diagnostics. Keys only, no values."""
+    names: list[str] = []
+    for key, _ in _walk_payload(payload):
+        if isinstance(key, str) and key not in names:
+            names.append(key)
+            if len(names) >= limit:
+                break
+    return names
 
 
 class AttendanceInterceptor:
@@ -1025,6 +1049,17 @@ class AttendanceInterceptor:
             seconds,
             status,
         )
+
+        # When half the payload parsed, print the key names (never the values -
+        # these responses carry employee data) so the missing pattern can be
+        # fixed from the log instead of by guessing at Zoho's schema.
+        if status is None or seconds is None:
+            missing = "status" if status is None else "duration"
+            log.info(
+                "No %s field matched. Keys present: %s",
+                missing,
+                ", ".join(_payload_key_names(payload)) or "(none)",
+            )
 
     def snapshot(self) -> Optional["AttendanceSnapshot"]:
         if self.seconds is None and self.status is None:
@@ -1167,6 +1202,17 @@ def read_attendance(page: Page) -> AttendanceSnapshot:
     return snapshot
 
 
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Telegram alert that fires at most once per run - two punches, one nag."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    send_telegram_msg(message)
+
+
 def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
     base = (os.getenv("CONTROL_CENTER_URL") or "").rstrip("/")
     if not base:
@@ -1192,6 +1238,27 @@ def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             log.info("Reported attendance to dashboard (HTTP %s).", response.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            # Silently dropping this is bad: the dashboard's 9.5h display goes
+            # stale and nothing on screen says why. Name the exact cause.
+            cause = (
+                "DISPATCH_SECRET is not set for this workflow, so no "
+                "Authorization header was sent"
+                if not secret
+                else "the workflow's DISPATCH_SECRET does not match the one "
+                "deployed with the dashboard"
+            )
+            log.error("Dashboard rejected the attendance snapshot (401): %s.", cause)
+            _warn_once(
+                "dashboard-401",
+                f"⚠️ Dashboard rejected the attendance snapshot (401): {cause}. "
+                f"Punching still works; the dashboard reading is stale.",
+            )
+        else:
+            log.warning(
+                "Could not report attendance to dashboard (HTTP %s): %s", exc.code, exc
+            )
     except Exception as exc:
         log.warning("Could not report attendance to dashboard: %s", exc)
 
@@ -1325,39 +1392,99 @@ def _confirm_punch(page: Page, target_text: str, timeout: int = 20_000) -> None:
     raise AutomationError(f"The {target_text} button stayed on screen; punch unconfirmed.")
 
 
+# Attendance states, kept distinct because "never checked in today" and
+# "checked in then out again" demand opposite handling in the evening.
+STATE_IN = "in"          # currently checked in
+STATE_OUT = "out"        # checked in earlier, now checked out
+STATE_NEVER = "never"    # no check-in recorded today
+STATE_UNKNOWN = "unknown"
+
+# Ordered: the first match wins, so the "Yet to Check-in" negation is tested
+# before the bare "check-in" it contains.
+_STATUS_RULES: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"yet\s+to\s+check|not\s+checked\s*-?\s*in|no\s+check\s*-?\s*in", re.I), STATE_NEVER),
+    (re.compile(r"absent|leave|holiday|weekly\s+off", re.I), STATE_NEVER),
+    (re.compile(r"checked\s*-?\s*out|punch(ed)?\s*-?\s*out|^\s*out\s*$", re.I), STATE_OUT),
+    (re.compile(r"checked\s*-?\s*in|punch(ed)?\s*-?\s*in|present|^\s*in\s*$", re.I), STATE_IN),
+]
+
+
+def classify_status(status: Optional[str]) -> str:
+    """
+    Map Zoho's status label onto a state.
+
+    Substring matching is not safe here: "Yet to Check-in" contains "in" and
+    not "out", so a naive test reads *not checked in* as *checked in* and would
+    aim a morning cron at Check-out. Order and word boundaries do the work.
+    """
+    if not status or not status.strip():
+        return STATE_UNKNOWN
+    for pattern, state in _STATUS_RULES:
+        if pattern.search(status):
+            return state
+    log.warning("Unrecognised attendance status %r; treating as unknown.", status[:60])
+    return STATE_UNKNOWN
+
+
+# IST hour before this is treated as the morning (check-in) half of the day.
+# The crons fire at 09:19 and 19:17 IST, so the boundary is nowhere near either.
+MORNING_CUTOFF_HOUR = 14
+
+
+def decide_punch(snapshot: AttendanceSnapshot) -> tuple[Optional[str], Optional[str]]:
+    """
+    Decide what to punch. Returns (target_text, skip_reason).
+
+    Intent comes from the dispatched action, or failing that from the time of
+    day in IST - not from the status label. Status is used to *veto* a punch
+    (duplicate, or nothing to check out of), never to invert the intent, so a
+    status Zoho renames cannot flip a morning run into a check-out.
+    """
+    dashboard_action = os.environ.get("DISPATCH_ACTION")
+    state = classify_status(snapshot.status)
+
+    if dashboard_action == "ACTION_ALPHA":
+        target, origin = "Check-in", "dispatched ACTION_ALPHA"
+    elif dashboard_action == "ACTION_BETA":
+        target, origin = "Check-out", "dispatched ACTION_BETA"
+    else:
+        hour = _ist_now().hour
+        morning = hour < MORNING_CUTOFF_HOUR
+        target = "Check-in" if morning else "Check-out"
+        origin = f"time of day ({hour:02d}:xx IST)"
+
+    log.info(
+        "Intent: %s from %s | status=%r -> state=%s",
+        target, origin, snapshot.status, state,
+    )
+
+    if target == "Check-in" and state == STATE_IN:
+        return None, "already checked in"
+
+    if target == "Check-out":
+        if state == STATE_OUT:
+            return None, "already checked out"
+        if state == STATE_NEVER:
+            # Nothing to check out of - the morning punch never landed. Punching
+            # anything here would be wrong, and the button will not exist.
+            return None, "no check-in recorded today, so there is nothing to check out"
+
+    return target, None
+
+
 def punch_attendance(page: Page) -> None:
     """Read state first to avoid duplicate punches, then execute punch."""
     snapshot = read_attendance(page)
-    status_str = (snapshot.status or "").lower()
-
     dashboard_action = os.environ.get("DISPATCH_ACTION")
-    
-    if dashboard_action == "ACTION_ALPHA":
-        target_text = "Check-in"
-    elif dashboard_action == "ACTION_BETA":
-        target_text = "Check-out"
-    else:
-        # Dynamic determination: if checked in -> Check-out; else -> Check-in
-        if "in" in status_str and "out" not in status_str:
-            target_text = "Check-out"
-        elif "out" in status_str:
-            target_text = "Check-in"
-        else:
-            is_morning = datetime.now(timezone.utc).hour < 10
-            target_text = "Check-in" if is_morning else "Check-out"
 
-    log.info("Target action: %s (Current Status: %s)", target_text, snapshot.status)
+    target_text, skip_reason = decide_punch(snapshot)
 
-    # --- IDEMPOTENCY / DUP-CHECK ---
-    if target_text == "Check-in" and ("in" in status_str and "out" not in status_str):
-        log.info("Already checked in! Skipping duplicate Check-in.")
-        send_telegram_msg(f"ℹ️ Already checked in at {_ist_now().strftime('%H:%M')} IST. Skipping duplicate punch.")
-        report_attendance(snapshot, source=dashboard_action or "PUNCH")
-        return
-
-    if target_text == "Check-out" and "out" in status_str:
-        log.info("Already checked out! Skipping duplicate Check-out.")
-        send_telegram_msg(f"ℹ️ Already checked out at {_ist_now().strftime('%H:%M')} IST. Skipping duplicate punch.")
+    if target_text is None:
+        log.info("Standing down: %s.", skip_reason)
+        send_telegram_msg(
+            f"ℹ️ No punch at {_ist_now().strftime('%H:%M')} IST - {skip_reason}.\n"
+            f"{snapshot.describe()}"
+        )
         report_attendance(snapshot, source=dashboard_action or "PUNCH")
         return
 
@@ -1374,6 +1501,11 @@ def punch_attendance(page: Page) -> None:
         human_pause(page, f"clicking {target_text}")
         button.click()
         log.info("Clicked %s; waiting for confirmation...", target_text)
+    except AutomationError:
+        # _punch_button exhausted every strategy; its message already says so.
+        # Capture the screen anyway - it is what gets pushed to Telegram.
+        page.screenshot(path="failure.png", full_page=True)
+        raise
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         page.screenshot(path="failure.png", full_page=True)
         raise AutomationError(f"Failed to find or click the {target_text} button.") from exc
