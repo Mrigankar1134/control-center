@@ -158,6 +158,11 @@ Intent comes from the dispatched action, or on a cron run from the **time of day
 
 `classify_status()` matches on word boundaries in a fixed order rather than testing substrings. This matters: **`"Yet to Check-in"` contains `"in"` and no `"out"`**, so the previous substring test read *not checked in* as *checked in* and would have aimed a morning cron at Check-out. Cron runs pass no `DISPATCH_ACTION`, so that was the live path. The 9.5 h guard would have caught it, but as a hard failure rather than a punch.
 
+### Two guards that fail closed
+
+- **The 9.5 h check-out guard refuses to guess.** If neither the API payload nor the widget yields an elapsed time, the bot **aborts instead of checking out**. It used to warn and proceed, which is how a 2 h 27 m day got punched out at 12:31 on 3 Aug 2026. An unverified check-out is a payroll problem; a missed one is a two-second manual fix. `ALLOW_UNVERIFIED_CHECKOUT=true` overrides it if you ever need to.
+- **Stale scheduled runs stand down.** GitHub's cron is best-effort and delays of hours happen. The workflow passes `github.event.schedule`, and a run starting more than `MAX_SCHEDULE_LATENESS_MIN` (default 30) past its window exits without punching and says so on Telegram. Manual dispatch is never blocked, and a run with no cron info proceeds rather than being blocked blindly.
+
 ### Failure handling
 
 - **Exit codes drive retries.** `0` success, `1` permanent, `75` transient. The workflow retries **only on 75** — DNS, proxy, runner network drops, or a late OTP mail — once, after a 5-minute backoff. A 9.5 h safety abort or a bad credential exits `1` and stops immediately; retrying those would just hammer Zoho's abuse filters. Retrying after a punch that already landed is safe, because the idempotency check re-reads the widget and skips the duplicate.

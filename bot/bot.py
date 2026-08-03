@@ -1194,9 +1194,23 @@ def read_attendance(page: Page) -> AttendanceSnapshot:
                 snapshot.seconds,
             )
         merged.dom_seconds = snapshot.seconds
+        # State both readings explicitly. The 9.5h guard depends on at least one
+        # of them, so "which source actually produced a number" is the first
+        # thing worth knowing when a check-out behaves oddly.
+        log.info(
+            "Sources: api=%ss, dom=%s, status=%r (%s)",
+            api.seconds,
+            f"{snapshot.seconds}s" if snapshot.seconds is not None else "unreadable",
+            merged.status,
+            "api" if api.status else "dom",
+        )
         snapshot = merged
     elif INTERCEPTOR is not None:
         INTERCEPTOR.log_summary()
+        log.info(
+            "Sources: api=none, dom=%s",
+            f"{snapshot.seconds}s" if snapshot.seconds is not None else "unreadable",
+        )
 
     log.info("Attendance: %s", snapshot.describe())
     return snapshot
@@ -1266,15 +1280,25 @@ def report_attendance(snapshot: AttendanceSnapshot, source: str) -> None:
 def verify_checkout_eligibility(page: Page) -> None:
     snapshot = read_attendance(page)
 
-    if snapshot.minutes is None or (not snapshot.settled and snapshot.minutes == 0):
-        log.warning("Could not read timer; skipping 9.5h check.")
-        send_telegram_msg("⚠️ Checking out without 9.5h verification - timer unreadable.")
-        return
+    if snapshot.seconds is None:
+        # FAIL CLOSED. This used to warn and check out anyway, which is how a
+        # 2h27m day got punched out at 12:31: the timer was unreadable, so the
+        # 9.5h rule was simply skipped. An unverified check-out is a payroll
+        # problem; a missed one is a two-second manual fix.
+        if os.getenv("ALLOW_UNVERIFIED_CHECKOUT", "").lower() in ("true", "1", "yes"):
+            log.warning("Timer unreadable but ALLOW_UNVERIFIED_CHECKOUT is set; proceeding.")
+            send_telegram_msg("⚠️ Checking out WITHOUT 9.5h verification (override set).")
+            return
+        raise AutomationError(
+            "SAFETY ABORT: could not read elapsed time from either the API or the "
+            "widget, so the 9.5-hour rule cannot be verified. Refusing to check out. "
+            "Check out manually, or set ALLOW_UNVERIFIED_CHECKOUT=true to override."
+        )
 
     # When both the API payload and the widget produced a number, trust the
     # smaller one. Under-reading costs a retry; over-reading punches out early.
     effective_seconds = snapshot.seconds
-    if snapshot.dom_seconds is not None and effective_seconds is not None:
+    if snapshot.dom_seconds is not None:
         effective_seconds = min(effective_seconds, snapshot.dom_seconds)
 
     total_minutes = effective_seconds // 60
@@ -1581,6 +1605,60 @@ def check_dashboard_policy() -> None:
             sys.exit(0)
 
 
+# GitHub's scheduled triggers are best-effort: under load they are delayed by
+# tens of minutes, and delays of hours happen during incidents. A cron meant for
+# 09:19 that actually starts at 12:06 must not punch - by then the state of the
+# day has moved on, which is exactly how a mid-day check-out happened.
+MAX_SCHEDULE_LATENESS_MIN = int(os.getenv("MAX_SCHEDULE_LATENESS_MIN", "30"))
+
+
+def _cron_target_utc(expression: str, now: datetime) -> Optional[datetime]:
+    """Today's UTC datetime for a 'M H * * D' cron expression."""
+    parts = expression.split()
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    return now.replace(
+        hour=int(parts[1]), minute=int(parts[0]), second=0, microsecond=0
+    )
+
+
+def check_run_freshness() -> None:
+    """Stand down when a scheduled run starts far outside its intended window."""
+    if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
+        return
+
+    expression = (os.getenv("SCHEDULED_CRON") or "").strip()
+    if not expression:
+        log.info("No SCHEDULED_CRON provided; skipping the lateness check.")
+        return
+
+    now = datetime.now(timezone.utc)
+    target = _cron_target_utc(expression, now)
+    if target is None:
+        log.warning("Could not parse SCHEDULED_CRON %r; skipping lateness check.", expression)
+        return
+
+    lateness = (now - target).total_seconds() / 60
+    if lateness < -5:  # fired early: clock skew, not our problem
+        return
+
+    if lateness > MAX_SCHEDULE_LATENESS_MIN:
+        target_ist = target.astimezone(IST).strftime("%H:%M")
+        log.error(
+            "Scheduled run is %.0f minutes late (cron %r targeted %s IST, "
+            "now %s IST). Standing down.",
+            lateness, expression, target_ist, _ist_now().strftime("%H:%M"),
+        )
+        send_telegram_msg(
+            f"⏱️ Skipped a stale scheduled run: the {target_ist} IST window started "
+            f"{lateness:.0f} minutes late (GitHub delay). No punch was made - "
+            f"dispatch manually if you still need it."
+        )
+        sys.exit(0)
+
+    log.info("Scheduled run is %.0f minutes after its window; proceeding.", lateness)
+
+
 def scheduled_jitter_seconds() -> int:
     schedule = _dashboard_get("/api/schedule")
     if schedule:
@@ -1822,6 +1900,7 @@ def run() -> None:
     status_check = os.getenv("DISPATCH_MODE", "PUNCH").upper() == "STATUS_CHECK"
 
     if not status_check:
+        check_run_freshness()
         check_dashboard_policy()
         randomize_start()
 

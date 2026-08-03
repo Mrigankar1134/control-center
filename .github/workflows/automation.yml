@@ -69,6 +69,9 @@ jobs:
       DISPATCH_SOURCE: ${{ inputs.source }}
       DISPATCH_DELAY_MS: ${{ inputs.delay_ms }}
       DISPATCH_BYPASS_DELAY: ${{ inputs.bypass_delay }}
+      # Which cron fired, so the bot can tell a punctual run from one GitHub
+      # delayed by hours. Empty on workflow_dispatch.
+      SCHEDULED_CRON: ${{ github.event.schedule }}
       CONTROL_CENTER_URL: ${{ secrets.CONTROL_CENTER_URL }}
       DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
