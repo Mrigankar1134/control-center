@@ -992,6 +992,26 @@ TOTAL_TIME_SELECTOR = "#totalInTime"
 ATT_STATUS_SELECTOR = "#att_status"
 REQUIRED_MINUTES = 9 * 60 + 30
 
+# --- The employee card -----------------------------------------------------
+# Top-left of My Space, and the only part of the page the punch logic may
+# believe. Its rows, in order:
+#
+#     153 - Mrigankar Sonowal      identity
+#     Management Trainee           designation
+#     In                           status - In or Out
+#     02 : 07 : 29                 elapsed, one span per digit group;
+#                                  must read >= 9.5h before a check-out
+#     [ Check-out ]                the actual button
+#
+# Scoping to this card is what keeps the bot off look-alike text elsewhere on
+# the same screen: "Yet to check-in" in Department Members, the "Attendance"
+# and "Time Logs" tabs, and the Work Schedule row that repeats today's hours
+# ("02:07 Hrs") all sit outside it.
+
+# The punch button's label is EXACTLY this - no "Time" suffix, no "Yet to"
+# prefix. Anchored at both ends, unlike the search pattern used for locating.
+_PUNCH_EXACT = re.compile(r"^\s*check\s*[-_ ]?\s*(in|out)\s*$", re.I)
+
 
 # ---------------------------------------------------------------------------
 # Network interception: read attendance straight from Zoho's XHR payloads
@@ -1257,13 +1277,33 @@ class AttendanceSnapshot:
         self.settled = settled
         self.origin = origin  # "api" (intercepted XHR) or "dom" (scraped widget)
         # Both raw readings are kept on merged snapshots. `seconds` above is the
-        # one worth reporting; the checkout guard separately takes the smallest
-        # of these, so a disagreement can never punch out early.
+        # one worth reporting; the checkout guard takes the smallest of these so
+        # that ordinary clock lag can never punch out early.
         self.dom_seconds: Optional[int] = None
         self.api_seconds: Optional[int] = None
+        # How the DOM number was obtained: "id" (#totalInTime) or "card" (the
+        # timer inside the employee card). Both are anchored on something that
+        # cannot drift onto the wrong number, which is what lets the guard
+        # prefer them over the API. None means no DOM reading at all.
+        self.dom_origin: Optional[str] = None
+        # Set when the two sources did not merely lag but genuinely disagreed and
+        # read_attendance picked a winner. See guard_seconds().
+        self.resolved_seconds: Optional[int] = None
 
     def guard_seconds(self) -> Optional[int]:
-        """Smallest elapsed reading available - what the 9.5h rule must use."""
+        """Elapsed reading the 9.5h rule must use.
+
+        Normally the smallest available: under-reading costs a retry, and
+        over-reading punches out early.
+
+        The exception is a recorded disagreement. The API's day total omits the
+        still-open punch pair, so while checked in it reads *hours* short by
+        design - and taking the minimum then means always taking the number we
+        already decided was wrong. That is how a 9h52m day aborted at 19:56 on
+        a 2h27m API reading. When a winner was chosen, honour it.
+        """
+        if self.resolved_seconds is not None:
+            return self.resolved_seconds
         readings = [
             value
             for value in (self.seconds, self.dom_seconds, self.api_seconds)
@@ -1276,13 +1316,92 @@ class AttendanceSnapshot:
         return None if self.seconds is None else self.seconds // 60
 
     def describe(self) -> str:
+        # "card" is worth surfacing: it means #totalInTime has gone and the
+        # timer is coming from the structural fallback. Everything still works,
+        # but it is the early warning that Zoho changed its markup.
+        where = self.origin if self.dom_origin != "card" else f"{self.origin}/card"
         if self.seconds is None:
-            return f"status={self.status or 'unknown'}, time unreadable [{self.origin}]"
+            return f"status={self.status or 'unknown'}, time unreadable [{where}]"
         h, rem = divmod(self.seconds, 3600)
         return (
             f"status={self.status or 'unknown'}, "
-            f"logged {h}h {rem // 60}m ({self.raw}) [{self.origin}]"
+            f"logged {h}h {rem // 60}m ({self.raw}) [{where}]"
         )
+
+
+# Finds the punch button by exact label, then walks up to the card around it
+# and reads the status and timer from inside. Done in one evaluate() because
+# every step depends on the previous one - seven locator round trips to learn
+# the same thing is both slower and racier while the widget is still settling.
+_CARD_PROBE_JS = r"""
+() => {
+  const PUNCH = /^\s*check\s*[-_ ]?\s*(in|out)\s*$/i;
+  const text = (el) => (el.innerText || el.textContent || '').trim();
+  const leaves = (root, sel) => [...root.querySelectorAll(sel)]
+    .filter((el) => el.children.length === 0)
+    .map(text);
+
+  // 1. The button. An exact label is the whole test: "Check-in Time" and
+  //    "Yet to check-in" match a substring search but not this.
+  const button = [...document.querySelectorAll(
+    'button, [role="button"], input[type="submit"], a'
+  )].find((el) => {
+    const label = text(el) || el.getAttribute('aria-label') || el.value || '';
+    if (!PUNCH.test(label)) return false;
+    const box = el.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;  // visible
+  });
+  if (!button) return null;
+
+  const label = text(button) || button.getAttribute('aria-label') || '';
+
+  // 2. The card. Walk up from the button until an ancestor holds a run of
+  //    pure-digit leaves - that is the HH : MM : SS display sitting directly
+  //    above it. Nearest ancestor wins, so digits further out on the page
+  //    (the Work Schedule dates) can never be picked up instead.
+  let node = button.parentElement;
+  for (let depth = 0; node && depth < 6; depth++, node = node.parentElement) {
+    const digits = leaves(node, 'span, div, p').filter((t) => /^\d{1,3}$/.test(t));
+    if (digits.length < 2) continue;
+
+    // 3. Status: the In/Out line, in the same card.
+    const words = leaves(node, 'span, div, p');
+    const status =
+      words.find((t) => /^(in|out)$/i.test(t)) ||
+      words.find((t) => t.length < 40 &&
+        /(yet\s+to\s+check|checked\s*-?\s*(in|out)|present|absent|on\s+leave)/i.test(t)) ||
+      null;
+
+    return { digits: digits.slice(0, 3), status, label, found: true };
+  }
+  return { digits: null, status: null, label, found: false };
+}
+"""
+
+
+def _probe_employee_card(page: Page) -> Optional[dict]:
+    """Read status and elapsed time from the card holding the punch button."""
+    try:
+        return page.evaluate(_CARD_PROBE_JS)
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        log.debug("Card probe failed: %s", exc)
+        return None
+
+
+def _seconds_from_digits(digits: list[str]) -> tuple[Optional[int], Optional[str]]:
+    """['02', '07', '29'] -> (7649, '02:07:29')."""
+    try:
+        parts = [int(part) for part in digits[:3]]
+    except (TypeError, ValueError):
+        return None, None
+    if not parts:
+        return None, None
+    hours = parts[0]
+    minutes = parts[1] if len(parts) > 1 else 0
+    seconds = parts[2] if len(parts) > 2 else 0
+    if minutes > 59 or seconds > 59:  # not a clock; something else was scraped
+        return None, None
+    return hours * 3600 + minutes * 60 + seconds, f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def _parse_timer_spans(page: Page) -> tuple[Optional[int], Optional[str]]:
@@ -1332,7 +1451,30 @@ def _read_attendance_once(page: Page) -> AttendanceSnapshot:
     except (PlaywrightError, PlaywrightTimeoutError):
         seconds, raw = None, None
 
-    return AttendanceSnapshot(status, seconds, raw)
+    dom_origin = "id" if seconds is not None else None
+
+    # Zoho has stripped readable IDs before, and #totalInTime going missing
+    # currently means an unreadable timer and a refused check-out. The card
+    # around the punch button is the structural answer: it is the number the
+    # employee is looking at when they press the button.
+    if seconds is None or status is None:
+        card = _probe_employee_card(page)
+        if card and card.get("found"):
+            if seconds is None and card.get("digits"):
+                seconds, raw = _seconds_from_digits(card["digits"])
+                if seconds is not None:
+                    dom_origin = "card"
+                    log.info(
+                        "Timer read from the employee card (%s) - %s did not resolve.",
+                        raw, TOTAL_TIME_SELECTOR,
+                    )
+            if status is None and card.get("status"):
+                status = card["status"]
+                log.info("Status read from the employee card: %r", status)
+
+    snapshot = AttendanceSnapshot(status, seconds, raw)
+    snapshot.dom_origin = dom_origin
+    return snapshot
 
 
 def read_attendance(page: Page) -> AttendanceSnapshot:
@@ -1370,10 +1512,16 @@ def read_attendance(page: Page) -> AttendanceSnapshot:
             settled=True,
             origin="api" if use_api_seconds else "api+dom",
         )
+        merged.dom_origin = snapshot.dom_origin
         if disagrees:
+            # The DOM wins here, and the guard has to be told so explicitly -
+            # otherwise it falls back to min() and quietly reinstates the API
+            # number this branch exists to reject.
+            merged.resolved_seconds = snapshot.seconds
             log.warning(
                 "API and DOM disagree on elapsed time (api=%ss, dom=%ss); "
-                "trusting DOM - the API total excludes the running session.",
+                "trusting DOM for both the report and the 9.5h guard - the API "
+                "total excludes the running session.",
                 api.seconds,
                 snapshot.seconds,
             )
@@ -1569,15 +1717,34 @@ def _punch_label_pattern(target_text: str) -> re.Pattern:
     """
     "Check-in" -> /check\\s*-?\\s*in\\b/i
 
-    Matches Check-in, Check In, CheckIn and Check_in. The trailing \\b keeps
-    "Check-in" from matching a "Check-in Time" column header, and the two
-    directions never collide because "in" and "out" are anchored separately.
+    Matches Check-in, Check In, CheckIn and Check_in. The two directions never
+    collide, because "in" and "out" are anchored separately.
+
+    It does NOT exclude labels like "Check-in Time" - the trailing \\b is
+    satisfied by the following space. Callers must therefore filter by
+    visibility rather than trusting a match to be the punch button itself.
     """
     direction = "out" if "out" in target_text.lower() else "in"
     return re.compile(rf"\bcheck[\s_-]*{direction}\b", re.I)
 
 
 PUNCH_LOOKUP_TIMEOUT = 15  # seconds to keep re-probing every strategy
+
+
+def _card_punch_button(page: Page, target_text: str):
+    """
+    The punch button as the employee sees it: exact label, inside the card that
+    also holds the In/Out line and the running timer.
+
+    Zoho renders the two directions one at a time, so asking for the wrong one
+    correctly matches nothing rather than falling through to a look-alike.
+    """
+    direction = "out" if "out" in target_text.lower() else "in"
+    return page.locator(
+        'button, [role="button"], input[type="submit"], a'
+    ).filter(
+        has_text=re.compile(rf"^\s*check\s*[-_ ]?\s*{direction}\s*$", re.I)
+    )
 
 
 def _punch_button(page: Page, target_text: str):
@@ -1594,6 +1761,10 @@ def _punch_button(page: Page, target_text: str):
 
     def build() -> list[tuple[str, object]]:
         return [
+        # 0. Inside the employee card. Most precise of all: this is the control
+        #    the timer and the In/Out line belong to, so it cannot be the
+        #    "Check-in Time" tab or a colleague's "Yet to check-in" row.
+        ("employee card", _card_punch_button(page, target_text)),
         # 1. Exact accessible name - unambiguous when Zoho keeps the label as-is.
         ("exact role", page.get_by_role("button", name=target_text, exact=True)),
         # 2. Same role, tolerant of spacing/casing drift ("Check In", "CheckIn").
@@ -1644,23 +1815,72 @@ def _punch_button(page: Page, target_text: str):
     )
 
 
+def _visible_button_count(page: Page, pattern: re.Pattern) -> int:
+    """How many *visible*, exactly-labelled punch buttons match. -1 on DOM churn.
+
+    Both filters matter. Zoho keeps both punch controls in the DOM and toggles
+    which one is shown, so hidden matches must not count; and "Check-in Time"
+    and "Yet to check-in" match the search pattern without being the button, so
+    the label has to be exact. Without either, count() never reaches zero.
+    """
+    try:
+        locator = page.get_by_role("button", name=pattern)
+        return sum(
+            1
+            for index in range(locator.count())
+            if locator.nth(index).is_visible()
+            and _PUNCH_EXACT.match((locator.nth(index).inner_text() or "").strip())
+        )
+    except (PlaywrightError, PlaywrightTimeoutError):
+        return -1  # neither confirms nor denies; caller keeps waiting
+
+
 def _confirm_punch(page: Page, target_text: str, timeout: int = 20_000) -> None:
-    """The punch is confirmed when the button we clicked stops being offered."""
+    """
+    Confirm the punch landed.
+
+    Three signals, strongest first: the opposite button is now offered, the one
+    we clicked is no longer offered, or the status label itself says we are in
+    (or out). Any one is enough.
+
+    The old test - "the clicked button disappeared from the DOM" - produced
+    false failures: at 09:04 on 4 Aug the check-in had visibly landed, timer
+    running and Check-out on screen, and the run was still reported as failed
+    because some hidden or unrelated Check-in element kept the count above zero.
+    A punch reported as failed invites a manual second punch, so a false
+    negative here is worse than a slow confirmation.
+    """
     deadline = time.monotonic() + timeout / 1000
-    pattern = _punch_label_pattern(target_text)
+    direction = "out" if "out" in target_text.lower() else "in"
+    opposite_text = "Check-in" if direction == "out" else "Check-out"
+    clicked = _punch_label_pattern(target_text)
+    opposite = _punch_label_pattern(opposite_text)
 
     while time.monotonic() < deadline:
-        try:
-            remaining = page.get_by_role("button", name=pattern).count()
-        except PlaywrightError:
-            remaining = 1  # transient DOM churn; keep waiting
-        if remaining == 0:
+        if _visible_button_count(page, opposite) > 0:
+            log.info("Confirmed: %s is now offered in its place.", opposite_text)
+            return
+        if _visible_button_count(page, clicked) == 0:
             log.info("Confirmed: %s button is gone.", target_text)
             return
         page.wait_for_timeout(500)
 
+    # Buttons were inconclusive. Ask Zoho what it thinks the state is - if it
+    # already says we are checked in, the punch landed and the widget is just
+    # rendering something the locators cannot read.
+    snapshot = read_attendance(page)
+    expected = STATE_OUT if direction == "out" else STATE_IN
+    if classify_status(snapshot.status) == expected:
+        log.info(
+            "Confirmed via status label %r: the %s landed.", snapshot.status, target_text
+        )
+        return
+
     page.screenshot(path="failure.png", full_page=True)
-    raise AutomationError(f"The {target_text} button stayed on screen; punch unconfirmed.")
+    raise AutomationError(
+        f"The {target_text} button stayed on screen and the status still reads "
+        f"{snapshot.status or 'unknown'!r}; punch unconfirmed."
+    )
 
 
 # Attendance states, kept distinct because "never checked in today" and
@@ -1920,17 +2140,29 @@ def check_dashboard_policy() -> None:
 # tens of minutes, and delays of hours happen during incidents. A cron meant for
 # 09:19 that actually starts at 12:06 must not punch - by then the state of the
 # day has moved on, which is exactly how a mid-day check-out happened.
-MAX_SCHEDULE_LATENESS_MIN = int(os.getenv("MAX_SCHEDULE_LATENESS_MIN", "30"))
+#
+# The flat 30-minute rule this replaced was far too tight: it threw away a 09:19
+# check-in that started at 09:55, still 35 minutes inside the 10:30 check-in
+# window and a perfectly good punch. What actually makes a late run unsafe is
+# missing its *window*, so that is what gets checked. The absolute ceiling below
+# only catches delays so extreme that the schedule is meaningless.
+MAX_SCHEDULE_LATENESS_MIN = int(os.getenv("MAX_SCHEDULE_LATENESS_MIN", "240"))
 
 
 def _cron_target_utc(expression: str, now: datetime) -> Optional[datetime]:
-    """Today's UTC datetime for a 'M H * * D' cron expression."""
+    """The most recent UTC datetime this 'M H * * D' cron expression targeted."""
     parts = expression.split()
     if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
         return None
-    return now.replace(
+    target = now.replace(
         hour=int(parts[1]), minute=int(parts[0]), second=0, microsecond=0
     )
+    # A run delayed across UTC midnight would otherwise pin yesterday's cron to
+    # today's date and read as ~24 hours *early*, which skips the lateness check
+    # entirely. Anchor to the occurrence that actually fired.
+    if target - now > timedelta(hours=12):
+        target -= timedelta(days=1)
+    return target
 
 
 def check_run_freshness() -> None:
@@ -1953,21 +2185,51 @@ def check_run_freshness() -> None:
     if lateness < -5:  # fired early: clock skew, not our problem
         return
 
-    if lateness > MAX_SCHEDULE_LATENESS_MIN:
-        target_ist = target.astimezone(IST).strftime("%H:%M")
+    if lateness <= 5:
+        return  # punctual
+
+    target_ist_dt = target.astimezone(IST)
+    target_ist = target_ist_dt.strftime("%H:%M")
+    now_ist = _ist_now()
+
+    # Which punch this cron was for decides which window still has to be open.
+    # Note this is only a freshness gate: decide_punch() re-checks the windows
+    # and the 9.5h rule regardless of how the run was triggered.
+    if target_ist_dt.hour < MORNING_CUTOFF_HOUR:
+        cutoff, intent = _ist_at(CHECKIN_LATEST), "check-in"
+    else:
+        cutoff, intent = _ist_at(CHECKOUT_DEADLINE), "check-out"
+
+    missed_window = now_ist > cutoff
+    absurdly_late = lateness > MAX_SCHEDULE_LATENESS_MIN
+
+    if missed_window or absurdly_late:
+        why = (
+            f"the {intent} window closed at {cutoff.strftime('%H:%M')}"
+            if missed_window
+            else f"that is beyond the {MAX_SCHEDULE_LATENESS_MIN} min ceiling"
+        )
         log.error(
             "Scheduled run is %.0f minutes late (cron %r targeted %s IST, "
-            "now %s IST). Standing down.",
-            lateness, expression, target_ist, _ist_now().strftime("%H:%M"),
+            "now %s IST) and %s. Standing down.",
+            lateness, expression, target_ist, now_ist.strftime("%H:%M"), why,
         )
         send_telegram_msg(
-            f"⏱️ Skipped a stale scheduled run: the {target_ist} IST window started "
-            f"{lateness:.0f} minutes late (GitHub delay). No punch was made - "
-            f"dispatch manually if you still need it."
+            f"⏱️ Skipped a stale scheduled run: the {target_ist} IST {intent} started "
+            f"{lateness:.0f} minutes late (GitHub delay) and {why}. No punch was "
+            f"made - dispatch manually if you still need it."
         )
         sys.exit(0)
 
-    log.info("Scheduled run is %.0f minutes after its window; proceeding.", lateness)
+    log.info(
+        "Scheduled run is %.0f minutes late but still inside the %s window "
+        "(closes %s IST); proceeding.",
+        lateness, intent, cutoff.strftime("%H:%M"),
+    )
+    send_telegram_msg(
+        f"⏱️ The {target_ist} IST {intent} started {lateness:.0f} minutes late "
+        f"(GitHub delay), but is still inside its window. Proceeding."
+    )
 
 
 def scheduled_jitter_seconds() -> int:
