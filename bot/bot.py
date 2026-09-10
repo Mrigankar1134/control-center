@@ -1933,6 +1933,19 @@ CHECKOUT_DEADLINE = os.getenv("CHECKOUT_DEADLINE", "20:00")
 MAX_CHECKOUT_WAIT_MIN = int(os.getenv("MAX_CHECKOUT_WAIT_MIN", "40"))
 
 
+def _is_manual_dispatch() -> bool:
+    """True when a human asked for this run, rather than a scheduler.
+
+    Read source, never the event name. Since the EventBridge scheduler took
+    over the clock (infra/eventbridge/), an unattended run also arrives as a
+    workflow_dispatch - it just carries source=CRON. Treating the event name
+    as proof of a human would hand every scheduled check-out a free pass past
+    the 9.5h guard. Anything unrecognised counts as not-manual, so a blank or
+    misspelt source keeps the guard rather than losing it.
+    """
+    return (os.getenv("DISPATCH_SOURCE") or "").strip().upper() == "MANUAL"
+
+
 def _ist_at(hhmm: str) -> datetime:
     """Today's IST datetime for an "HH:MM" string."""
     hour, _, minute = hhmm.partition(":")
@@ -2044,8 +2057,18 @@ def punch_attendance(page: Page) -> None:
         return
 
     if target_text == "Check-out":
-        log.info("Executing 9.5-hour safety check before checking out...")
-        verify_checkout_eligibility(page)
+        if _is_manual_dispatch():
+            # A manual dispatch is a deliberate instruction from the operator,
+            # who can see the widget themselves. The 9.5h guard exists to stop
+            # an unattended cron from punching out a half-finished day; holding
+            # or aborting a hand-pressed check-out just means it never happens.
+            log.info("Manual dispatch: skipping the 9.5-hour check before check-out.")
+            send_telegram_msg(
+                "⚠️ Manual check-out: the 9.5h requirement was not checked."
+            )
+        else:
+            log.info("Executing 9.5-hour safety check before checking out...")
+            verify_checkout_eligibility(page)
 
     # Clear anything that drifted in while we were reading the widget - a modal
     # here intercepts the click and the run times out looking for the button.
@@ -2193,8 +2216,8 @@ def check_run_freshness() -> None:
     now_ist = _ist_now()
 
     # Which punch this cron was for decides which window still has to be open.
-    # Note this is only a freshness gate: decide_punch() re-checks the windows
-    # and the 9.5h rule regardless of how the run was triggered.
+    # Note this is only a freshness gate: decide_punch() re-checks the windows,
+    # and a scheduled check-out still goes through the 9.5h rule.
     if target_ist_dt.hour < MORNING_CUTOFF_HOUR:
         cutoff, intent = _ist_at(CHECKIN_LATEST), "check-in"
     else:

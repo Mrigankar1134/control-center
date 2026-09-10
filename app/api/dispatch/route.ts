@@ -4,10 +4,15 @@ import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 
 import { db } from "@/db";
-import { actionTypeEnum, dispatchLogs, holidayExceptions } from "@/db/schema";
-import type { ActionType } from "@/db/schema";
+import {
+  actionTypeEnum,
+  dispatchLogs,
+  holidayExceptions,
+  scheduleConfig,
+} from "@/db/schema";
+import type { ActionType, DayOfWeek } from "@/db/schema";
 import { triggerDownstream, type DispatchPayload } from "@/lib/github";
-import { MAX_MANUAL_DELAY_MS } from "@/lib/constants";
+import { MAX_MANUAL_DELAY_MS, WEEKDAYS } from "@/lib/constants";
 import { recordAudit } from "@/lib/audit";
 import {
   UNLOCK_COOKIE,
@@ -81,6 +86,70 @@ async function exceptionForToday() {
   }
 }
 
+const IST_OFFSET_MS = (5 * 60 + 30) * 60_000;
+
+const DAY_NAMES = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+] as const;
+
+/**
+ * Today's weekday in IST, or null on a weekend. Both windows (09:19 and 19:17
+ * IST) land on the same calendar date in IST and in UTC, so this agrees with
+ * `exceptionForToday()` above even though that one reads the server's date.
+ */
+function istWeekday(): DayOfWeek | null {
+  const name = DAY_NAMES[new Date(Date.now() + IST_OFFSET_MS).getUTCDay()];
+  return (WEEKDAYS as readonly string[]).includes(name)
+    ? (name as DayOfWeek)
+    : null;
+}
+
+/**
+ * Whether the scheduler is armed for today. "Pause automation" in the console
+ * writes `enabled = false`, and something has to read it or the switch is
+ * decorative.
+ *
+ * The bot asks this itself in `check_dashboard_policy()`, but only on a
+ * `schedule` event. Since EventBridge took over the clock (infra/eventbridge/)
+ * every scheduled run arrives as a `workflow_dispatch`, so the bot never asks
+ * and the gate has to live here — before the workflow is even started.
+ */
+async function scheduleArmedToday(): Promise<{
+  armed: boolean;
+  reason: string | null;
+}> {
+  const day = istWeekday();
+  if (!day) {
+    return { armed: false, reason: "today is a weekend" };
+  }
+
+  try {
+    const [row] = await db
+      .select()
+      .from(scheduleConfig)
+      .where(eq(scheduleConfig.dayOfWeek, day))
+      .limit(1);
+
+    // A missing row is a day nobody has configured, which the console renders
+    // as enabled. Fail open, exactly as the bot's own policy check does: a
+    // missed punch costs more than an extra one.
+    if (!row) return { armed: true, reason: null };
+
+    return row.enabled
+      ? { armed: true, reason: null }
+      : { armed: false, reason: `${day} is paused in the console` };
+  } catch (error) {
+    console.error("[dispatch] schedule lookup failed", error);
+    return { armed: true, reason: null };
+  }
+}
+
 export async function POST(request: Request) {
   let body: DispatchBody;
   try {
@@ -132,6 +201,18 @@ export async function POST(request: Request) {
   // A holiday exception silences the scheduler, never the operator: manual runs
   // stay available on an excepted day, cron runs do not.
   if (source === "CRON") {
+    const armed = await scheduleArmedToday();
+    if (!armed.armed) {
+      return NextResponse.json(
+        {
+          skipped: true,
+          reason: armed.reason,
+          message: `No run was started: ${armed.reason}.`,
+        },
+        { status: 200 },
+      );
+    }
+
     const skip = await exceptionForToday();
     if (skip) {
       return NextResponse.json(

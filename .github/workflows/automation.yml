@@ -37,6 +37,7 @@ on:
       source:
         description: "MANUAL or CRON — who asked for this run"
         required: false
+        default: MANUAL
         type: string
       form_url:
         description: "Override the Zoho sign-in URL (data centre)"

@@ -44,3 +44,6 @@ test-results/
 .vscode/
 .idea/
 Thumbs.db
+
+# Lambda build artefact from infra/eventbridge/setup.sh
+infra/eventbridge/.build/

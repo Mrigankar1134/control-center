@@ -43,7 +43,7 @@ python bot/bot.py
 
 **Web — AWS Amplify.** Connect the repo; Amplify detects Next.js and provisions SSR compute. `amplify.yml` writes the console's environment variables into `.env.production` during `preBuild`, because the SSR Lambda does not inherit them automatically. Set every variable listed in that file under *App settings → Environment variables*.
 
-**Bot — GitHub Actions.** Nothing to deploy. `automation.yml` runs on the two weekday crons, or on demand via `workflow_dispatch`. Its secrets live in *Settings → Secrets and variables → Actions*, not in Amplify:
+**Bot — GitHub Actions.** Nothing to deploy. `automation.yml` runs on `workflow_dispatch` — from the console, or from the EventBridge scheduler that holds the clock. Its secrets live in *Settings → Secrets and variables → Actions*, not in Amplify:
 
 | Secret | Purpose |
 | --- | --- |
@@ -55,20 +55,25 @@ python bot/bot.py
 
 The dashboard triggers the workflow with a fine-grained PAT in `GITHUB_TOKEN` carrying **Actions: read and write** on this repo.
 
+**Clock — AWS EventBridge Scheduler.** See [`infra/eventbridge/`](infra/eventbridge/). GitHub's `schedule:` event is best-effort and was arriving **3 h 20 m – 4 h 50 m late every weekday**, so the morning cron landed past the 10:30 window and stood down; the repo's own `workflow_dispatch` runs over the same period started within seconds. EventBridge now calls `POST /api/dispatch` on time and that fires the dispatch. The two GitHub crons are kept as a backup — a duplicate is vetoed, a late one stands down.
+
 ## The dashboard is the source of truth
 
-The bot keeps no schedule of its own. On a **scheduled** run it asks the dashboard three questions before it does anything:
+The bot keeps no schedule of its own, and two questions are asked before any scheduled run starts:
 
-1. `GET /api/exceptions?upcoming=1` — is today a holiday? If so it exits 0 (a skipped day is a success, not a failure).
-2. `GET /api/schedule` — is this weekday still `enabled`? "Pause automation" in the console has to stop the cron too, or the button is decorative.
-3. The same response supplies `randomOffsetMinutes`, which becomes the jitter ceiling — so the window the overview renders (`09:19–09:44`) is the window actually slept, with no hardcoded constant to drift from it.
+1. **Is today an exception?** A holiday silences the scheduler, never the operator.
+2. **Is this weekday still `enabled`?** "Pause automation" in the console has to stop the scheduler too, or the switch is decorative.
 
 There is deliberately **no `SKIP_DATES` secret**. A second copy of the holiday list would silently disagree with the calendar UI.
+
+**Both gates live in `POST /api/dispatch`** (`exceptionForToday()` and `scheduleArmedToday()`), so they run *before* the workflow is started. They used to live in the bot's `check_dashboard_policy()`, which asked the dashboard over HTTP — but that only ran on a `schedule` event, and since EventBridge took over the clock every scheduled run arrives as a `workflow_dispatch`. Leaving them there would have quietly un-armed both. `check_dashboard_policy()` still exists and still guards the backup crons.
 
 Two consequences worth knowing:
 
 - **Manual dispatch is never blocked.** A human tapping the button on an excepted day means it; the API permits it and the console banners why.
-- **The check fails open.** If the dashboard is unreachable the run proceeds, because a missed attendance punch costs more than a punch on a holiday. It logs loudly and pushes a Telegram warning when configured. Invert this in `check_dashboard_policy()` if you would rather miss a punch than risk one.
+- **The gates fail open.** If the lookup fails the run proceeds, because a missed attendance punch costs more than a punch on a holiday.
+
+One thing the move gave up: `randomOffsetMinutes` no longer drives scheduled jitter. That ceiling reached the bot in the same `GET /api/schedule` response and was slept in the runner; the jitter is now the EventBridge schedule's flexible time window. [`infra/eventbridge/README.md`](infra/eventbridge/README.md) explains why, and how to change it.
 
 `DISPATCH_DELAY_MS` is reported for correlation only — the console already served that delay in the browser before calling the API, so the bot must not sleep on it a second time.
 
@@ -95,7 +100,7 @@ With no downstream driver configured, dispatches are still recorded in Neon and 
 ```
 Inserts an `EXECUTING` row, applies jitter (skipped when `bypassDelay`), calls the downstream driver, then updates the row to `SUCCESS` / `FAILED` with duration, error, and artifact URL. Returns `200` on success, `502` on downstream failure.
 
-Cron callers add `"source": "CRON"` and must send `X-Dispatch-Secret: $DISPATCH_SECRET`.
+Cron callers add `"source": "CRON"` and must send `X-Dispatch-Secret: $DISPATCH_SECRET`. That source is also what gates them: a `CRON` call is refused with `200 {"skipped": true, "reason": ...}` on a paused weekday or a calendar exception, and it is what tells the bot this run is unattended, so the 9.5 h guard applies. EventBridge sends `"bypassDelay": true` so the route does not hold the request open for its own jitter.
 
 ### `GET /api/schedule`
 Returns all five weekdays, backfilling defaults (`09:19` / `19:17` / ±25 min) for days with no row yet.
@@ -191,7 +196,9 @@ Two related traps this closes:
 ### Two guards that fail closed
 
 - **The 9.5 h check-out guard refuses to guess.** If neither the API payload nor the widget yields an elapsed time, the bot **aborts instead of checking out**. It used to warn and proceed, which is how a 2 h 27 m day got punched out at 12:31 on 3 Aug 2026. An unverified check-out is a payroll problem; a missed one is a two-second manual fix. `ALLOW_UNVERIFIED_CHECKOUT=true` overrides it if you ever need to.
-- **Stale scheduled runs stand down.** GitHub's cron is best-effort and delays of hours happen. The workflow passes `github.event.schedule`, and a late run is judged against the window its cron was for: a delayed morning run still punches while the `CHECKIN_LATEST` (10:30) window is open, a delayed evening run while `CHECKOUT_DEADLINE` (20:00) is, and anything past its window — or more than `MAX_SCHEDULE_LATENESS_MIN` (default 240) late — exits without punching and says so on Telegram. Either way the delay is reported. Manual dispatch is never blocked, and a run with no cron info proceeds rather than being blocked blindly.
+
+  **The guard applies to unattended runs only.** A manual dispatch skips it: the operator pressed the button and can see the widget themselves, and holding or aborting a hand-pressed check-out just means it never happens. Telegram still says the requirement went unchecked, so an unverified punch leaves a trace. "Manual" is read from `DISPATCH_SOURCE` (`MANUAL`), never from the event name — since EventBridge drives the clock, a scheduled run is *also* a `workflow_dispatch`, it just carries `source=CRON`. Anything unrecognised counts as not-manual, so a blank source keeps the guard rather than losing it.
+- **Stale scheduled runs stand down.** GitHub's cron is best-effort and delays of hours are exactly what happened here — which is why the clock moved to EventBridge and these crons are now only a backup. The workflow passes `github.event.schedule`, and a late run is judged against the window its cron was for: a delayed morning run still punches while the `CHECKIN_LATEST` (10:30) window is open, a delayed evening run while `CHECKOUT_DEADLINE` (20:00) is, and anything past its window — or more than `MAX_SCHEDULE_LATENESS_MIN` (default 240) late — exits without punching and says so on Telegram. Either way the delay is reported. Manual dispatch is never blocked, and a run with no cron info proceeds rather than being blocked blindly.
 
 ### Failure handling
 
