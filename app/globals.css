@@ -2,185 +2,240 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer base {
-  :root {
+/*
+ * Liquid glass, two themes.
+ *
+ * The whole look rests on three ideas:
+ *   1. A fixed, blurred colour field behind everything. Nothing in the page
+ *      paints an opaque background, so that field shows through every surface.
+ *   2. Surfaces are translucent + backdrop-blurred, with a bright hairline on
+ *      the top edge and a dark one underneath. That pair is what reads as
+ *      "thick glass" rather than "semi-transparent div".
+ *   3. Colour is carried almost entirely by the field. Controls are neutral
+ *      glass; only the two punch actions take a tint.
+ *
+ * Every colour is defined on :root so no value exists only inside a media
+ * query. The dark block redefines the same names, and [data-theme] wins over
+ * both so the manual toggle works in either direction.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* The field behind the glass. */
+  --field: #eef1f6;
+  --blob-1: rgba(120, 160, 255, 0.55);
+  --blob-2: rgba(255, 140, 200, 0.40);
+  --blob-3: rgba(110, 230, 210, 0.42);
+  --blob-4: rgba(255, 200, 120, 0.34);
+
+  /* Glass surfaces, light to heavy. */
+  --glass: rgba(255, 255, 255, 0.58);
+  --glass-raised: rgba(255, 255, 255, 0.72);
+  --glass-sunken: rgba(255, 255, 255, 0.34);
+  --glass-hover: rgba(255, 255, 255, 0.82);
+
+  /* The hairline pair that sells the thickness. */
+  --edge-top: rgba(255, 255, 255, 0.95);
+  --edge: rgba(16, 22, 40, 0.10);
+  --inner-glow: rgba(255, 255, 255, 0.60);
+
+  --ink: #111520;
+  --ink-soft: #4a5263;
+  --ink-faint: #7b8396;
+
+  --tint-in: #0a84ff;
+  --tint-out: #ff9f0a;
+  --ok: #1fa463;
+  --warn: #c7820a;
+  --bad: #e5484d;
+
+  --shadow-card: 0 1px 1px rgba(16, 22, 40, 0.04),
+    0 8px 24px -12px rgba(16, 22, 40, 0.18);
+  --shadow-lift: 0 2px 2px rgba(16, 22, 40, 0.05),
+    0 18px 48px -20px rgba(16, 22, 40, 0.28);
+
+  --blur: 28px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
     color-scheme: dark;
 
-    --border-subtle: rgba(255, 255, 255, 0.06);
-    --border-default: rgba(255, 255, 255, 0.1);
-    --border-strong: rgba(255, 255, 255, 0.16);
-    --border-focus: rgba(79, 172, 254, 0.6);
+    --field: #06070b;
+    --blob-1: rgba(70, 110, 255, 0.40);
+    --blob-2: rgba(215, 70, 175, 0.30);
+    --blob-3: rgba(30, 190, 180, 0.28);
+    --blob-4: rgba(190, 120, 40, 0.24);
+
+    --glass: rgba(255, 255, 255, 0.065);
+    --glass-raised: rgba(255, 255, 255, 0.10);
+    --glass-sunken: rgba(0, 0, 0, 0.22);
+    --glass-hover: rgba(255, 255, 255, 0.14);
+
+    --edge-top: rgba(255, 255, 255, 0.22);
+    --edge: rgba(255, 255, 255, 0.08);
+    --inner-glow: rgba(255, 255, 255, 0.10);
+
+    --ink: #f4f6fb;
+    --ink-soft: #a7afc0;
+    --ink-faint: #6f788c;
+
+    --tint-in: #3d9bff;
+    --tint-out: #ffab33;
+    --ok: #30d47f;
+    --warn: #ffc452;
+    --bad: #ff6369;
+
+    --shadow-card: 0 1px 1px rgba(0, 0, 0, 0.35),
+      0 10px 28px -14px rgba(0, 0, 0, 0.7);
+    --shadow-lift: 0 2px 3px rgba(0, 0, 0, 0.4),
+      0 24px 56px -22px rgba(0, 0, 0, 0.85);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --field: #06070b;
+  --blob-1: rgba(70, 110, 255, 0.40);
+  --blob-2: rgba(215, 70, 175, 0.30);
+  --blob-3: rgba(30, 190, 180, 0.28);
+  --blob-4: rgba(190, 120, 40, 0.24);
+
+  --glass: rgba(255, 255, 255, 0.065);
+  --glass-raised: rgba(255, 255, 255, 0.10);
+  --glass-sunken: rgba(0, 0, 0, 0.22);
+  --glass-hover: rgba(255, 255, 255, 0.14);
+
+  --edge-top: rgba(255, 255, 255, 0.22);
+  --edge: rgba(255, 255, 255, 0.08);
+  --inner-glow: rgba(255, 255, 255, 0.10);
+
+  --ink: #f4f6fb;
+  --ink-soft: #a7afc0;
+  --ink-faint: #6f788c;
+
+  --tint-in: #3d9bff;
+  --tint-out: #ffab33;
+  --ok: #30d47f;
+  --warn: #ffc452;
+  --bad: #ff6369;
+
+  --shadow-card: 0 1px 1px rgba(0, 0, 0, 0.35),
+    0 10px 28px -14px rgba(0, 0, 0, 0.7);
+  --shadow-lift: 0 2px 3px rgba(0, 0, 0, 0.4),
+    0 24px 56px -22px rgba(0, 0, 0, 0.85);
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
   }
 
-  html,
   body {
-    height: 100%;
+    background-color: var(--field);
+    color: var(--ink);
+    /* Safe areas matter: this runs as a standalone PWA on iOS. */
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
-  body {
-    @apply bg-bg-primary text-content-secondary antialiased;
-    font-size: 0.875rem;
-    /* A single low-amplitude ambient wash — not a light show. */
-    background-image: radial-gradient(
-      1200px circle at 50% -20%,
-      rgba(30, 38, 64, 0.5),
-      transparent 65%
-    );
-    background-attachment: fixed;
+  /*
+   * The colour field. Fixed so it does not scroll with content, and behind
+   * everything via a negative z-index on a ::before rather than a real element,
+   * so no component has to know about it.
+   */
+  body::before {
+    content: "";
+    position: fixed;
+    inset: -20vmax;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(38vmax 38vmax at 12% 8%, var(--blob-1), transparent 62%),
+      radial-gradient(34vmax 34vmax at 88% 14%, var(--blob-2), transparent 62%),
+      radial-gradient(42vmax 42vmax at 78% 88%, var(--blob-3), transparent 64%),
+      radial-gradient(30vmax 30vmax at 20% 84%, var(--blob-4), transparent 62%);
+    filter: blur(36px) saturate(120%);
+  }
+
+  /* Numerals in tables and timers must not wobble as values change. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--tint-in);
+    outline-offset: 2px;
   }
 
   ::selection {
-    background: rgba(79, 172, 254, 0.25);
-  }
-
-  * {
-    scrollbar-width: thin;
-    scrollbar-color: rgba(148, 163, 184, 0.2) transparent;
-  }
-  *::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-  *::-webkit-scrollbar-thumb {
-    background: rgba(148, 163, 184, 0.18);
-    border-radius: 999px;
-  }
-  *::-webkit-scrollbar-thumb:hover {
-    background: rgba(148, 163, 184, 0.35);
-  }
-  *::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  input[type="time"]::-webkit-calendar-picker-indicator {
-    filter: invert(0.7);
-    cursor: pointer;
-    opacity: 0.45;
-  }
-  input[type="time"]::-webkit-calendar-picker-indicator:hover {
-    opacity: 0.9;
-  }
-
-  /* Hide number spinners; we provide explicit steppers. */
-  input[type="number"]::-webkit-outer-spin-button,
-  input[type="number"]::-webkit-inner-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-  }
-  input[type="number"] {
-    -moz-appearance: textfield;
+    background: color-mix(in srgb, var(--tint-in) 28%, transparent);
   }
 }
 
 @layer components {
   /*
-   * One panel treatment for the whole product. Workspaces use this;
-   * content inside them is separated by dividers and rows, not by
-   * nested cards.
+   * One surface primitive. `backdrop-filter` needs a stacking context and a
+   * background that is actually translucent, so both live here rather than
+   * being reassembled per component.
    */
-  .panel {
-    @apply rounded-panel border border-[var(--border-default)] bg-surface-primary/70 shadow-elevated backdrop-blur-xl;
+  .glass {
+    position: relative;
+    background: var(--glass);
+    backdrop-filter: blur(var(--blur)) saturate(180%);
+    -webkit-backdrop-filter: blur(var(--blur)) saturate(180%);
+    border: 1px solid var(--edge);
+    box-shadow: var(--shadow-card), inset 0 1px 0 var(--edge-top);
   }
 
-  /* Quiet inner grouping — a recessed well, not another card. */
-  .well {
-    @apply rounded-control border border-[var(--border-subtle)] bg-white/[0.02];
+  .glass-raised {
+    background: var(--glass-raised);
+    box-shadow: var(--shadow-lift), inset 0 1px 0 var(--edge-top);
   }
 
-  .divider {
-    @apply border-t border-[var(--border-subtle)];
-  }
-
-  /* Visible, consistent keyboard focus everywhere. */
-  .focus-ring {
-    @apply outline-none focus-visible:ring-2 focus-visible:ring-[var(--border-focus)] focus-visible:ring-offset-2 focus-visible:ring-offset-bg-primary;
+  .glass-sunken {
+    background: var(--glass-sunken);
+    box-shadow: inset 0 1px 2px rgba(16, 22, 40, 0.10);
+    border: 1px solid var(--edge);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
   }
 
   /*
-   * Terminal surface. Solid black, phosphor-green scrollbar — deliberately
-   * different from every other scroll region so the log reads as machine
-   * output rather than as UI.
+   * A specular sheen across the top third. Subtle on purpose: the moment it is
+   * visible as a gradient it stops reading as light on a surface.
    */
-  .terminal-scroll {
-    scrollbar-color: rgba(0, 245, 160, 0.35) rgba(0, 0, 0, 0.9);
-  }
-  .terminal-scroll::-webkit-scrollbar {
-    width: 10px;
-  }
-  .terminal-scroll::-webkit-scrollbar-track {
-    background: #000;
-  }
-  .terminal-scroll::-webkit-scrollbar-thumb {
-    background: rgba(0, 245, 160, 0.28);
-    border: 2px solid #000;
-    border-radius: 999px;
-  }
-  .terminal-scroll::-webkit-scrollbar-thumb:hover {
-    background: rgba(0, 245, 160, 0.5);
-  }
-
-  /* Minimum comfortable hit area for interactive controls. */
-  .touch-target {
-    @apply relative;
-  }
-  .touch-target::after {
+  .sheen::after {
     content: "";
     position: absolute;
-    inset: 50% 50% 50% 50%;
-    width: 44px;
-    height: 44px;
-    transform: translate(-50%, -50%);
-    pointer-events: auto;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background: linear-gradient(
+      180deg,
+      var(--inner-glow) 0%,
+      transparent 38%
+    );
+    opacity: 0.7;
+  }
+
+  .hairline {
+    border-color: var(--edge);
   }
 }
 
-@layer utilities {
-  .tabular {
-    font-variant-numeric: tabular-nums;
-  }
-
-  /* Section eyebrows: uppercase without the tracking overdose. */
-  .eyebrow {
-    @apply text-meta font-medium uppercase tracking-[0.08em] text-content-muted;
-  }
-
-  .no-scrollbar::-webkit-scrollbar {
-    display: none;
-  }
-  .no-scrollbar {
-    -ms-overflow-style: none;
-    scrollbar-width: none;
-  }
-
-  /*
-   * Installed to the home screen, the app runs with viewport-fit=cover and a
-   * translucent status bar: the viewport starts at the physical top of the
-   * screen, so anything anchored to top: 0 renders *under* the clock and the
-   * carrier icons. Every such surface pads itself by the inset instead. The
-   * value is 0 in a normal browser tab, so these are inert on desktop.
-   */
-  .pad-safe-top {
-    padding-top: env(safe-area-inset-top, 0px);
-  }
-  .pad-safe-bottom {
-    padding-bottom: env(safe-area-inset-bottom, 0px);
-  }
-  /* For overlays that already carry their own padding. */
-  .inset-safe {
-    padding-top: max(1rem, env(safe-area-inset-top, 0px));
-    padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px));
-    padding-left: max(1rem, env(safe-area-inset-left, 0px));
-    padding-right: max(1rem, env(safe-area-inset-right, 0px));
-  }
-}
-
+/* Respect the system setting; only the field and presence dot animate at all. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
-    animation-duration: 0.01ms !important;
+    animation-duration: 0.001ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-    scroll-behavior: auto !important;
+    transition-duration: 0.001ms !important;
   }
 }

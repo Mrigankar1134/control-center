@@ -1,7 +1,13 @@
 import type { Config } from "tailwindcss";
 
+/*
+ * Every colour here resolves to a CSS variable defined in globals.css, so the
+ * light/dark swap happens in one place and Tailwind never needs a `dark:`
+ * variant for colour. `darkMode: "class"` stays only so the odd genuinely
+ * theme-specific tweak is still expressible.
+ */
 const config: Config = {
-  darkMode: "class",
+  darkMode: ["class", '[data-theme="dark"]'],
   content: [
     "./app/**/*.{ts,tsx}",
     "./components/**/*.{ts,tsx}",
@@ -10,95 +16,91 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
-        // Background / surface ladder — most of the UI lives here.
-        bg: {
-          primary: "#090D16",
-          elevated: "#0E1421",
+        field: "var(--field)",
+        glass: {
+          DEFAULT: "var(--glass)",
+          raised: "var(--glass-raised)",
+          sunken: "var(--glass-sunken)",
+          hover: "var(--glass-hover)",
         },
-        surface: {
-          primary: "#121827",
-          secondary: "#161E2F",
-          hover: "#1A2437",
+        edge: {
+          DEFAULT: "var(--edge)",
+          top: "var(--edge-top)",
         },
-        // Text ladder
-        content: {
-          primary: "#F5F7FB",
-          secondary: "#A8B1C2",
-          muted: "#717B90",
-          disabled: "#4D5668",
+        ink: {
+          DEFAULT: "var(--ink)",
+          soft: "var(--ink-soft)",
+          faint: "var(--ink-faint)",
         },
-        // Semantic accents — used sparingly (~10% of surface area).
-        alpha: {
-          DEFAULT: "#4FACFE",
-          bright: "#00F2FE",
-          dim: "#2A6E9E",
+        tint: {
+          in: "var(--tint-in)",
+          out: "var(--tint-out)",
         },
-        beta: {
-          DEFAULT: "#B47CFF",
-          bright: "#E100FF",
-          dim: "#6B3FA0",
-        },
-        success: "#00F5A0",
-        warning: "#FFB300",
-        danger: "#FF3366",
-        info: "#4FACFE",
+        ok: "var(--ok)",
+        warn: "var(--warn)",
+        bad: "var(--bad)",
       },
       fontFamily: {
-        sans: ["var(--font-inter)", "ui-sans-serif", "system-ui", "sans-serif"],
+        // The Apple stack first: on the devices this is used from, that is the
+        // real SF Pro, which is most of why the UI reads as native.
+        sans: [
+          "-apple-system",
+          "BlinkMacSystemFont",
+          "SF Pro Text",
+          "Segoe UI Variable",
+          "Segoe UI",
+          "system-ui",
+          "sans-serif",
+        ],
         mono: [
-          "var(--font-jetbrains)",
           "ui-monospace",
+          "SF Mono",
           "SFMono-Regular",
+          "Menlo",
+          "Cascadia Mono",
           "monospace",
         ],
       },
       fontSize: {
-        // Accessible scale — metadata never drops below 11px.
-        meta: ["0.6875rem", { lineHeight: "1rem" }], // 11px
-        support: ["0.75rem", { lineHeight: "1.125rem" }], // 12px
-        body: ["0.8125rem", { lineHeight: "1.25rem" }], // 13px
-        "body-lg": ["0.875rem", { lineHeight: "1.375rem" }], // 14px
-        "card-title": ["0.9375rem", { lineHeight: "1.375rem" }], // 15px
-        "section-title": ["1.125rem", { lineHeight: "1.625rem" }], // 18px
-        "page-title": ["1.5rem", { lineHeight: "2rem" }], // 24px
-        metric: ["1.75rem", { lineHeight: "2.125rem" }], // 28px
+        // Roughly Apple's type ladder. Nothing below 11px.
+        caption: ["0.6875rem", { lineHeight: "0.9375rem", letterSpacing: "0.01em" }],
+        footnote: ["0.75rem", { lineHeight: "1.0625rem" }],
+        subhead: ["0.8125rem", { lineHeight: "1.1875rem" }],
+        body: ["0.9375rem", { lineHeight: "1.375rem" }],
+        headline: ["1.0625rem", { lineHeight: "1.4375rem", letterSpacing: "-0.01em" }],
+        title: ["1.375rem", { lineHeight: "1.75rem", letterSpacing: "-0.02em" }],
+        display: ["2rem", { lineHeight: "2.375rem", letterSpacing: "-0.03em" }],
+        hero: ["2.75rem", { lineHeight: "3rem", letterSpacing: "-0.035em" }],
       },
       borderRadius: {
-        control: "10px",
-        panel: "14px",
+        // Apple's continuous-corner look needs generous radii.
+        pill: "999px",
+        control: "14px",
+        card: "22px",
+        sheet: "28px",
       },
-      boxShadow: {
-        // Restrained: elevation reads as depth, not as glow.
-        elevated: "0 18px 44px -28px rgba(0, 0, 0, 0.85)",
-        "accent-alpha": "0 6px 20px -10px rgba(79, 172, 254, 0.55)",
-        "accent-beta": "0 6px 20px -10px rgba(180, 124, 255, 0.55)",
-        focus: "0 0 0 2px rgba(9, 13, 22, 1), 0 0 0 4px rgba(79, 172, 254, 0.6)",
-      },
-      transitionDuration: {
-        press: "110ms",
-        status: "180ms",
-        expand: "200ms",
-        drawer: "260ms",
+      transitionTimingFunction: {
+        // The spring-ish curve Apple uses for most non-interactive motion.
+        apple: "cubic-bezier(0.32, 0.72, 0, 1)",
       },
       keyframes: {
-        "breathe": {
-          "0%, 100%": { opacity: "1" },
-          "50%": { opacity: "0.55" },
+        "pulse-dot": {
+          "0%, 100%": { opacity: "1", transform: "scale(1)" },
+          "50%": { opacity: "0.45", transform: "scale(0.86)" },
         },
-        "fade-in": {
-          from: { opacity: "0" },
-          to: { opacity: "1" },
+        "rise-in": {
+          from: { opacity: "0", transform: "translateY(6px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
         },
-        "indeterminate": {
+        sweep: {
           "0%": { transform: "translateX(-100%)" },
           "100%": { transform: "translateX(300%)" },
         },
       },
       animation: {
-        // Only the live system indicator breathes.
-        breathe: "breathe 2.4s ease-in-out infinite",
-        "fade-in": "fade-in 200ms ease-out both",
-        indeterminate: "indeterminate 1.4s ease-in-out infinite",
+        "pulse-dot": "pulse-dot 2.2s ease-in-out infinite",
+        "rise-in": "rise-in 320ms cubic-bezier(0.32, 0.72, 0, 1) both",
+        sweep: "sweep 1.5s ease-in-out infinite",
       },
     },
   },

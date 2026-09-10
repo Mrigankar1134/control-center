@@ -1,33 +1,26 @@
 import type { Metadata, Viewport } from "next";
-import { Inter, JetBrains_Mono } from "next/font/google";
 
 import { ServiceWorker } from "@/components/ServiceWorker";
 import { ToastProvider } from "@/components/ui/toast";
 
 import "./globals.css";
 
-const inter = Inter({
-  subsets: ["latin"],
-  variable: "--font-inter",
-  display: "swap",
-});
-
-/* Reserved for machine data only: clocks, durations, IDs, payloads. */
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ["latin"],
-  variable: "--font-jetbrains",
-  display: "swap",
-});
+/*
+ * No webfont is loaded on purpose. The type stack in tailwind.config.ts starts
+ * with -apple-system, so on the devices this is opened from the UI renders in
+ * SF Pro — which is most of why it reads as native rather than as a web page
+ * imitating one. It also removes two network requests from first paint.
+ */
 
 export const metadata: Metadata = {
-  title: "Neural Control",
-  description:
-    "Automation control center for scheduled and manual dispatch, with live execution history.",
-  applicationName: "Neural Control",
+  title: "Attendance Control",
+  description: "Scheduled and manual attendance dispatch, with run history.",
+  applicationName: "Attendance Control",
   manifest: "/manifest.json",
   appleWebApp: {
     capable: true,
-    title: "Neural Control",
+    title: "Attendance",
+    // Translucent lets the colour field run under the status bar in standalone.
     statusBarStyle: "black-translucent",
   },
   icons: {
@@ -37,17 +30,19 @@ export const metadata: Metadata = {
     ],
     apple: [{ url: "/icons/apple-touch-icon.png", sizes: "180x180" }],
   },
-  // The dashboard is an operator tool, not a page anyone should index.
+  // An operator tool, not something to index.
   robots: { index: false, follow: false },
   formatDetection: { telephone: false },
 };
 
 export const viewport: Viewport = {
-  themeColor: "#090D16",
+  // One per scheme so the browser chrome matches the field in both themes.
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#eef1f6" },
+    { media: "(prefers-color-scheme: dark)", color: "#06070b" },
+  ],
   width: "device-width",
   initialScale: 1,
-  // Standalone mode should feel native: no accidental pinch-zoom on controls,
-  // and content extends under the translucent iOS status bar.
   maximumScale: 1,
   viewportFit: "cover",
 };
@@ -58,13 +53,13 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
-      <body className="min-h-screen font-sans">
+    <html lang="en" suppressHydrationWarning>
+      <body className="min-h-screen font-sans text-body antialiased">
         <a
           href="#main"
-          className="sr-only focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-[100] focus:rounded-control focus:bg-surface-primary focus:px-4 focus:py-2 focus:text-body focus:text-content-primary focus:ring-2 focus:ring-alpha"
+          className="glass sr-only rounded-control focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus:z-50 focus:px-4 focus:py-2 focus:text-subhead focus:text-ink"
         >
-          Skip to main content
+          Skip to content
         </a>
         <ServiceWorker />
         <ToastProvider>{children}</ToastProvider>
