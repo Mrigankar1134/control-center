@@ -9,7 +9,10 @@ export const WEEKDAYS: DayOfWeek[] = [
   "Friday",
 ];
 
-export const DEFAULT_WINDOW_A_TIME = "09:05";
+// Mirrors CHECKIN_CRON / CHECKOUT_CRON in infra/eventbridge/setup.sh, which is
+// what actually fires. Nothing keeps the two in step automatically -- moving a
+// window means editing both. The relay then adds 0-10 min on top of these.
+export const DEFAULT_WINDOW_A_TIME = "09:03";
 export const DEFAULT_WINDOW_B_TIME = "18:35";
 export const DEFAULT_RANDOM_OFFSET_MINUTES = 10;
 export const MIN_RANDOM_OFFSET_MINUTES = 0;

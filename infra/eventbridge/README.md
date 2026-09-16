@@ -45,8 +45,8 @@ caller's behalf. So an external scheduler now holds the clock.
 ## The chain
 
 ```
-EventBridge Schedule  (cron in Asia/Kolkata, + flexible window for jitter)
-  -> Lambda control-center-dispatch     (a relay, ~40 lines)
+EventBridge Schedule  (cron in Asia/Kolkata, exact minute)
+  -> Lambda control-center-dispatch     (sleeps 0–10 min, then relays)
     -> POST /api/dispatch  { action, source: "CRON", bypassDelay: true }
       -> gates: weekday enabled? today an exception?
       -> triggerDownstream() -> GitHub workflow_dispatch  (starts in seconds)
@@ -58,10 +58,10 @@ straight to an EventBridge API destination — does not work. Scheduler's target
 are a fixed list (Lambda, SQS, SNS, Step Functions, ECS, …) and API destinations
 are not on it; passing one gives `ValidationException: Provided Arn is not in
 correct format`. API destinations belong to EventBridge **Rules**, and Rules
-have neither `ScheduleExpressionTimezone` nor `FlexibleTimeWindow`, so they
-cannot express "09:05–09:15 IST, randomly". Scheduler has both. The relay is the
-cheapest way to keep them: no dependencies, and 44 invocations a month sits well
-inside the Lambda free tier.
+have no `ScheduleExpressionTimezone`, so they cannot even express "09:03 IST".
+Scheduler has it. The relay is the cheapest way to keep it: no dependencies, and
+44 invocations a month sits well inside the Lambda free tier even with the sleep
+described below.
 
 Four AWS resources, all created by `setup.sh`:
 
@@ -70,7 +70,7 @@ Four AWS resources, all created by `setup.sh`:
 | Lambda | `control-center-dispatch` | Relays the punch to `POST /api/dispatch`. Holds `DASHBOARD_URL` and `DISPATCH_SECRET` as environment variables. Source in `lambda/dispatch.py`. |
 | IAM role | `control-center-dispatch-lambda` | The function's execution role — CloudWatch Logs and nothing else. |
 | IAM role | `control-center-scheduler` | Assumed by `scheduler.amazonaws.com`, may only `lambda:InvokeFunction` on that one function. |
-| Schedules | `control-center-checkin`, `control-center-checkout` | `Asia/Kolkata`, Mon–Fri: check in 09:05–09:15, check out 18:35–18:45. |
+| Schedules | `control-center-checkin`, `control-center-checkout` | `Asia/Kolkata`, Mon–Fri: check in 09:03, check out 18:35. Exact minutes — the relay adds the jitter. |
 
 ## Running it
 
@@ -84,26 +84,50 @@ Needs the AWS CLI authenticated against the account that hosts the Amplify app.
 Re-running is safe — every step is create-or-update — so this is also how you
 change a time, the jitter, or a rotated secret. Overridable by environment:
 `AWS_REGION`, `PREFIX`, `JITTER_MINUTES`, `TZ_NAME`, `CHECKIN_CRON`,
-`CHECKOUT_CRON`.
+`CHECKOUT_CRON`. `JITTER_MINUTES` reaches the function as the `JITTER_SECONDS`
+environment variable and also sets its timeout, so change it here rather than in
+the Lambda console.
 
-## Two decisions worth knowing
+## Where the jitter lives, and why it moved
 
-**`bypassDelay: true` is deliberate**, and the Lambda always sends it. Without
-it the route sleeps a random interval up to `MAX_MANUAL_DELAY_MS` (30 s)
-*inside the request* before calling GitHub, which just burns Lambda duration. The jitter comes
-from the schedule's `FlexibleTimeWindow` instead, which shifts the invocation
-itself rather than stalling a request already in flight — and costs nothing.
+**In the relay, as a sleep.** `lambda/dispatch.py` draws `0..JITTER_SECONDS`
+from `os.urandom` and sleeps it before POSTing, and prints the draw to
+CloudWatch on every invocation.
 
-**So the console's `randomOffsetMinutes` no longer drives scheduled jitter.**
-It used to: the bot read it from `GET /api/schedule` and slept for it, but only
-on a `schedule` event, which no longer happens. The jitter is now
-`JITTER_MINUTES` (10). Nothing reads the console value any more, so the two are
-kept in step **by hand** — `schedule_config` is currently set to `09:05` /
+It used to come from the schedule's `FlexibleTimeWindow`, which is the better
+design on paper — it shifts the invocation itself rather than stalling a request
+already in flight, and costs nothing. It just did not deliver. The punch landed
+at **09:08 IST every single day**: the 09:05 cron plus the ~3 minutes the rest
+of the chain takes, with nothing in between. Whatever the window was choosing,
+it was not a spread, and nothing reported what it had chosen. A sleep in the
+relay is worse on paper and observable in practice, which is the trade being
+made here.
+
+Consequences worth knowing:
+
+- **The cron moved to 09:03.** The sleep only ever pushes the punch later, so
+  leaving it at 09:05 would have put the entire band after the time it used to
+  land. 09:03 + 0–10 min + ~3 min of chain puts the punch around
+  **09:06–09:16**, centred on the old 09:08.
+- **The window is `{"Mode":"OFF"}`.** One source of jitter, not two stacking
+  into a band nobody can predict.
+- **The function's timeout is `JITTER_SECONDS + 90`** (690 s at the default),
+  because it now sleeps inside the invocation. Worst case is under 4,000 GB-s a
+  month against a 400,000 GB-s free tier.
+- **`bypassDelay: true` is still deliberate**, and the Lambda still always sends
+  it. The route's own delay is capped at `MAX_MANUAL_DELAY_MS` (30 s), too short
+  to be real jitter, and it burns the relay's duration anyway while it waits for
+  the response — so the sleep happens before the POST, not during it.
+
+**The console's `randomOffsetMinutes` still drives none of this.** The bot read
+it from `GET /api/schedule` and slept for it, but only on a `schedule` event,
+which no longer happens. Nothing reads the console value any more, so the two
+are kept in step **by hand** — `schedule_config` should read `09:03` /
 `18:35` / ±10 to match the crons above, and changing one means changing the
 other. To move the windows:
 
 ```bash
-CHECKIN_CRON='cron(5 9 ? * MON-FRI *)' CHECKOUT_CRON='cron(35 18 ? * MON-FRI *)' JITTER_MINUTES=10 DASHBOARD_URL=... DISPATCH_SECRET=... ./infra/eventbridge/setup.sh
+CHECKIN_CRON='cron(3 9 ? * MON-FRI *)' CHECKOUT_CRON='cron(35 18 ? * MON-FRI *)' JITTER_MINUTES=10 DASHBOARD_URL=... DISPATCH_SECRET=... ./infra/eventbridge/setup.sh
 ```
 
 Then update the console to agree, or the schedule matrix will describe a day
@@ -111,13 +135,13 @@ that is not happening:
 
 ```bash
 curl -X POST "$DASHBOARD_URL/api/schedule" -H "Content-Type: application/json"   -d '{"reason":"...","updates":[{"dayOfWeek":"Monday","enabled":true,
-       "windowATime":"09:05","windowBTime":"18:35","randomOffsetMinutes":10}]}'
+       "windowATime":"09:03","windowBTime":"18:35","randomOffsetMinutes":10}]}'
 ```
 
 ### The 9.5 h is the bot's job, not the scheduler's
 
-The two windows do not by themselves satisfy Zoho: check in at 09:15, punch out
-at 18:35, and you are 10 minutes short. Nothing tries to make the scheduler
+The two windows do not by themselves satisfy Zoho: check in at 09:13, punch out
+at 18:35, and you are 8 minutes short. Nothing tries to make the scheduler
 clever about this. `verify_checkout_eligibility()` already holds a short
 check-out open for the shortfall — budget `MAX_CHECKOUT_WAIT_MIN` (40 min) —
 reloads, re-reads the widget, and punches only once the requirement is actually
@@ -180,7 +204,7 @@ Check what the schedules currently hold, and what the relay did:
 aws scheduler get-schedule --name control-center-checkin
 aws scheduler list-schedules --name-prefix control-center
 
-# What the relay saw, including the dashboard's response body
+# What the relay saw: the jitter it drew, and the dashboard's response body
 aws logs tail /aws/lambda/control-center-dispatch --since 2d
 
 # Invocation failures show up here, not in the dashboard logs.

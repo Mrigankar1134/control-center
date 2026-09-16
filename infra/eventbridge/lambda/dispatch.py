@@ -1,11 +1,20 @@
 """Calls POST /api/dispatch on the dashboard. Invoked by EventBridge Scheduler.
 
-This function exists for one reason: EventBridge Scheduler cannot call an HTTPS
-endpoint. Its targets are a fixed list (Lambda, SQS, SNS, Step Functions, ECS,
-...) and API destinations are not on it -- those belong to EventBridge *Rules*,
-which in turn have no timezone support and no flexible time window, so they
-cannot produce a randomised 09:05-09:15 punch. Scheduler has both, so the
-cheapest way to keep them is to give it a target it understands.
+This function exists for two reasons.
+
+**Scheduler cannot call an HTTPS endpoint.** Its targets are a fixed list
+(Lambda, SQS, SNS, Step Functions, ECS, ...) and API destinations are not on it
+-- those belong to EventBridge *Rules*, which in turn have no timezone support,
+so they cannot express "09:03 IST, Mon-Fri". Scheduler has the timezone, so the
+cheapest way to keep it is to give it a target it understands.
+
+**And it holds the jitter.** Scheduler's own FlexibleTimeWindow was supposed to
+randomise the punch inside a ten-minute band, but the punch was landing at the
+same minute (09:08 IST) every single day, so whatever the window was doing, it
+was not producing a spread anyone could see. The window is now OFF -- the cron
+fires at an exact minute -- and the spread comes from the sleep below, which
+CloudWatch prints on every run, so "is the jitter working" is a question with
+an answer.
 
 Failures raise, so the schedule's RetryPolicy gets a chance. A 200 carrying
 {"skipped": true} is not a failure: a paused weekday or a holiday exception is
@@ -14,10 +23,30 @@ the dashboard answering correctly.
 
 import json
 import os
+import random
+import time
 import urllib.error
 import urllib.request
 
 VALID_ACTIONS = ("ACTION_ALPHA", "ACTION_BETA")
+
+DEFAULT_JITTER_SECONDS = 600  # 10 minutes, matching the old flexible window
+
+# os.urandom per call, not a seeded PRNG. A warm container resumes the module's
+# random state where the last invocation left it, and at two invocations a day
+# that is exactly the failure being fixed here -- the same delay drawn every
+# morning. SystemRandom cannot get stuck that way.
+_rng = random.SystemRandom()
+
+
+def _jitter_seconds() -> int:
+    """Upper bound on the sleep, from JITTER_SECONDS. Never negative."""
+    raw = (os.environ.get("JITTER_SECONDS") or "").strip()
+    try:
+        return max(0, int(raw)) if raw else DEFAULT_JITTER_SECONDS
+    except ValueError:
+        print(f"JITTER_SECONDS={raw!r} is not a number; using {DEFAULT_JITTER_SECONDS}")
+        return DEFAULT_JITTER_SECONDS
 
 
 def handler(event, _context):
@@ -28,6 +57,17 @@ def handler(event, _context):
     if action not in VALID_ACTIONS:
         # A malformed schedule should be loud, not retried 5 times.
         raise ValueError(f"action must be one of {VALID_ACTIONS}, got {action!r}")
+
+    # Sleep first, dispatch second: the point is to move the punch, and the
+    # punch happens downstream of the POST. 0 is a legal draw -- landing on the
+    # cron minute itself is part of the spread, not a bug.
+    ceiling = _jitter_seconds()
+    delay = _rng.randint(0, ceiling) if ceiling else 0
+    if delay:
+        print(f"dispatch {action}: jitter {delay}s of a possible {ceiling}s")
+        time.sleep(delay)
+    else:
+        print(f"dispatch {action}: no jitter (ceiling {ceiling}s)")
 
     body = json.dumps(
         {"action": action, "source": "CRON", "bypassDelay": True}
@@ -41,7 +81,7 @@ def handler(event, _context):
         with urllib.request.urlopen(request, timeout=45) as response:
             payload = response.read().decode("utf-8")
             print(f"dispatch {action}: HTTP {response.status} {payload}")
-            return {"status": response.status, "body": payload}
+            return {"status": response.status, "jitterSeconds": delay, "body": payload}
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")
         print(f"dispatch {action}: HTTP {exc.code} {detail}")

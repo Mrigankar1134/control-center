@@ -10,10 +10,11 @@
 # that route fires a workflow_dispatch, which starts immediately.
 #
 # The chain is Schedule -> Lambda -> POST /api/dispatch. The Lambda is a relay
-# and nothing more: Scheduler cannot call an HTTPS endpoint (API destinations
-# are a target of EventBridge *Rules*, not Scheduler), and Rules have neither
-# timezone support nor a flexible time window, so they cannot randomise the
-# punch inside a window. See lambda/dispatch.py.
+# and a dice roll, nothing more: Scheduler cannot call an HTTPS endpoint (API
+# destinations are a target of EventBridge *Rules*, not Scheduler), and Rules
+# have no timezone support, so they cannot express "09:03 IST". The relay also
+# holds the jitter, because Scheduler's own flexible window was not producing
+# one. See lambda/dispatch.py.
 #
 # Re-running this script is safe: everything is create-or-update.
 #
@@ -24,7 +25,7 @@
 # Optional:
 #   AWS_REGION        defaults to your configured region
 #   PREFIX            resource name prefix, defaults to control-center
-#   JITTER_MINUTES    flexible-window width, defaults to 10
+#   JITTER_MINUTES    width of the random delay the relay sleeps, defaults to 10
 #
 # Usage:
 #   DASHBOARD_URL=https://... DISPATCH_SECRET=... ./infra/eventbridge/setup.sh
@@ -34,12 +35,24 @@ set -euo pipefail
 PREFIX="${PREFIX:-control-center}"
 TZ_NAME="${TZ_NAME:-Asia/Kolkata}"
 
-# Check in 09:05-09:15, check out 18:35-18:45, randomised inside the window by
-# FlexibleTimeWindow. AWS cron is six fields:
+# Check in 09:03, check out 18:35, each then delayed 0-JITTER_MINUTES by the
+# relay itself. AWS cron is six fields:
 # minute hour day-of-month month day-of-week year.
 #
+# The jitter deliberately does NOT come from Scheduler's FlexibleTimeWindow any
+# more. That was the original design and it read well, but the punch landed at
+# 09:08 IST every single day regardless -- whatever the window was choosing, it
+# was not a spread. So the window is OFF (the cron fires at an exact minute) and
+# lambda/dispatch.py draws the delay from os.urandom and prints it to
+# CloudWatch, where it can be checked.
+#
+# 09:03 rather than the old 09:05 because the delay only ever runs the punch
+# later: the chain from POST to a recorded punch costs about three minutes, so
+# 09:03 + 0-10 min puts the punch somewhere around 09:06-09:16, a band centred
+# on where it has actually been landing.
+#
 # These windows do NOT by themselves satisfy the 9.5h Zoho requires: check in at
-# 09:15, punch out at 18:35, and you are 10 minutes short. The bot closes that
+# 09:13, punch out at 18:35, and you are 8 minutes short. The bot closes that
 # gap, not the scheduler -- verify_checkout_eligibility() holds a short
 # check-out open for the shortfall (budget MAX_CHECKOUT_WAIT_MIN, 40 min),
 # reloads, re-reads the widget, and punches only once the requirement is met.
@@ -47,7 +60,7 @@ TZ_NAME="${TZ_NAME:-Asia/Kolkata}"
 #
 # Keep these in step with window_a_time / window_b_time in schedule_config,
 # which is what the console renders.
-CHECKIN_CRON="${CHECKIN_CRON:-cron(5 9 ? * MON-FRI *)}"
+CHECKIN_CRON="${CHECKIN_CRON:-cron(3 9 ? * MON-FRI *)}"
 CHECKOUT_CRON="${CHECKOUT_CRON:-cron(35 18 ? * MON-FRI *)}"
 JITTER_MINUTES="${JITTER_MINUTES:-10}"
 
@@ -138,7 +151,18 @@ if [ ! -s "$HERE/.build/dispatch.zip" ]; then
 fi
 trap 'rm -rf "$HERE/.build"' EXIT
 
-ENV_JSON="{\"Variables\":{\"DASHBOARD_URL\":\"${DASHBOARD_URL}\",\"DISPATCH_SECRET\":\"${DISPATCH_SECRET}\"}}"
+JITTER_SECONDS=$(( JITTER_MINUTES * 60 ))
+
+# The function sleeps the jitter before it POSTs, so the timeout has to cover
+# the whole sleep plus the request (45s) with room to spare, or a long draw is
+# killed mid-nap and Scheduler retries a punch that was going to work.
+#
+# This costs Lambda duration, which the flexible window did not -- but at 128MB
+# and 44 invocations a month the worst case is under 4,000 GB-s against a
+# 400,000 GB-s free tier, which is a rounding error for jitter that works.
+LAMBDA_TIMEOUT=$(( JITTER_SECONDS + 90 ))
+
+ENV_JSON="{\"Variables\":{\"DASHBOARD_URL\":\"${DASHBOARD_URL}\",\"DISPATCH_SECRET\":\"${DISPATCH_SECRET}\",\"JITTER_SECONDS\":\"${JITTER_SECONDS}\"}}"
 
 if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
   say "Updating function $FUNCTION_NAME"
@@ -149,7 +173,7 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; the
   aws lambda update-function-configuration \
     --function-name "$FUNCTION_NAME" \
     --environment "$ENV_JSON" \
-    --timeout 60 >/dev/null
+    --timeout "$LAMBDA_TIMEOUT" >/dev/null
   aws lambda wait function-updated --function-name "$FUNCTION_NAME"
 else
   say "Creating function $FUNCTION_NAME"
@@ -163,7 +187,7 @@ else
       --handler dispatch.handler \
       --zip-file "fileb://$ZIP" \
       --environment "$ENV_JSON" \
-      --timeout 60 \
+      --timeout "$LAMBDA_TIMEOUT" \
       --description "Relays the scheduled punch to POST /api/dispatch" >/dev/null 2>&1
     then
       created=1
@@ -181,7 +205,7 @@ else
       --handler dispatch.handler \
       --zip-file "fileb://$ZIP" \
       --environment "$ENV_JSON" \
-      --timeout 60 >&2
+      --timeout "$LAMBDA_TIMEOUT" >&2
     exit 1
   fi
   aws lambda wait function-active --function-name "$FUNCTION_NAME"
@@ -243,9 +267,14 @@ sleep 10
 
 # --- 4. The two schedules --------------------------------------------------
 # The Lambda sets bypassDelay:true on the POST. Without it the route sleeps up
-# to MAX_MANUAL_DELAY_MS (30s) inside the request before calling GitHub; the
-# jitter comes from FlexibleTimeWindow instead, which moves the invocation
-# itself and costs nothing.
+# to MAX_MANUAL_DELAY_MS (30s) inside the request before calling GitHub, which
+# is both too short to be real jitter and charged to Lambda duration anyway
+# while the relay sits waiting for the response.
+#
+# FlexibleTimeWindow is OFF on purpose. It is the obvious place for the jitter
+# and it is where the jitter used to live, but it produced the same 09:08 punch
+# every day; the relay draws the delay itself now, so the schedule's job is
+# just to fire on an exact minute.
 target_json() {
   local action="$1"
   printf '{
@@ -263,12 +292,12 @@ put_schedule() {
     verb=update
   fi
 
-  say "Running ${verb}-schedule for $name ($expression $TZ_NAME, +0-${JITTER_MINUTES}m)"
+  say "Running ${verb}-schedule for $name ($expression $TZ_NAME; relay adds +0-${JITTER_MINUTES}m)"
   aws scheduler "${verb}-schedule" \
     --name "$name" \
     --schedule-expression "$expression" \
     --schedule-expression-timezone "$TZ_NAME" \
-    --flexible-time-window "{\"Mode\":\"FLEXIBLE\",\"MaximumWindowInMinutes\":${JITTER_MINUTES}}" \
+    --flexible-time-window '{"Mode":"OFF"}' \
     --target "$(target_json "$action")" \
     --state ENABLED \
     --description "Neural Control $action" >/dev/null
