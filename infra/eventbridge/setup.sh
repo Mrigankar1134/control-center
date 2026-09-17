@@ -40,16 +40,24 @@ TZ_NAME="${TZ_NAME:-Asia/Kolkata}"
 # minute hour day-of-month month day-of-week year.
 #
 # The jitter deliberately does NOT come from Scheduler's FlexibleTimeWindow any
-# more. That was the original design and it read well, but the punch landed at
-# 09:08 IST every single day regardless -- whatever the window was choosing, it
-# was not a spread. So the window is OFF (the cron fires at an exact minute) and
-# lambda/dispatch.py draws the delay from os.urandom and prints it to
-# CloudWatch, where it can be checked.
+# more. That was the original design, the window was configured correctly
+# (FLEXIBLE, 10 minutes, on both schedules), and it still produced the same
+# punch minute every day. CloudWatch says why: the relay was invoked at
+# 09:07:43, :45, :43, :43, :43 on five consecutive weekdays, and check-out at
+# 18:40:49 on four. The window does apply an offset -- 2m43s into one, 5m49s
+# into the other -- but it picks that offset once per schedule and keeps it,
+# spreading load across schedules rather than across days. A schedule that does
+# not change gets one minute for life.
 #
-# 09:03 rather than the old 09:05 because the delay only ever runs the punch
-# later: the chain from POST to a recorded punch costs about three minutes, so
-# 09:03 + 0-10 min puts the punch somewhere around 09:06-09:16, a band centred
-# on where it has actually been landing.
+# So the window is OFF (the cron fires on the exact minute) and
+# lambda/dispatch.py draws the delay per invocation from os.urandom, printing
+# it to CloudWatch so a stuck one would be visible next time.
+#
+# 09:03 rather than the old 09:05 because the sleep only ever runs the punch
+# later. Relay to recorded punch is under a minute -- the three minutes it
+# looked like was the window's fixed offset, not the chain -- so 09:03 + 0-10
+# min puts the punch in 09:03-09:13, centred on the 09:08 it has been landing
+# on.
 #
 # These windows do NOT by themselves satisfy the 9.5h Zoho requires: check in at
 # 09:13, punch out at 18:35, and you are 8 minutes short. The bot closes that

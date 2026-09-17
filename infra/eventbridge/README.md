@@ -96,19 +96,31 @@ CloudWatch on every invocation.
 
 It used to come from the schedule's `FlexibleTimeWindow`, which is the better
 design on paper — it shifts the invocation itself rather than stalling a request
-already in flight, and costs nothing. It just did not deliver. The punch landed
-at **09:08 IST every single day**: the 09:05 cron plus the ~3 minutes the rest
-of the chain takes, with nothing in between. Whatever the window was choosing,
-it was not a spread, and nothing reported what it had chosen. A sleep in the
-relay is worse on paper and observable in practice, which is the trade being
-made here.
+already in flight, and costs nothing. It just did not deliver, and the window
+was configured correctly the whole time (`FLEXIBLE`, 10 minutes, both
+schedules). CloudWatch has the explanation:
+
+```
+Fri 11 Sep  09:07:43        Fri 11 Sep  18:40:49
+Mon 14 Sep  09:07:45        Mon 14 Sep  18:40:49
+Tue 15 Sep  09:07:43        Tue 15 Sep  18:40:49
+Wed 16 Sep  09:07:43        Wed 16 Sep  18:40:49
+Thu 17 Sep  09:07:43
+```
+
+The window **does** apply an offset — 2m43s into the check-in window, 5m49s
+into the check-out one — but it draws that offset once per schedule and then
+reuses it. It spreads load across schedules, not across days, so a schedule
+that never changes fires on the same second for life. A sleep in the relay is
+worse on paper and observably random in practice, which is the trade.
 
 Consequences worth knowing:
 
 - **The cron moved to 09:03.** The sleep only ever pushes the punch later, so
   leaving it at 09:05 would have put the entire band after the time it used to
-  land. 09:03 + 0–10 min + ~3 min of chain puts the punch around
-  **09:06–09:16**, centred on the old 09:08.
+  land. Relay to recorded punch is under a minute — the ~3 minutes it looked
+  like from the outside was the window's fixed offset, not the chain — so
+  09:03 + 0–10 min puts the punch in **09:03–09:13**, centred on the old 09:08.
 - **The window is `{"Mode":"OFF"}`.** One source of jitter, not two stacking
   into a band nobody can predict.
 - **The function's timeout is `JITTER_SECONDS + 90`** (690 s at the default),

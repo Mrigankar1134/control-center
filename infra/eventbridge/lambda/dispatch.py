@@ -9,12 +9,13 @@ so they cannot express "09:03 IST, Mon-Fri". Scheduler has the timezone, so the
 cheapest way to keep it is to give it a target it understands.
 
 **And it holds the jitter.** Scheduler's own FlexibleTimeWindow was supposed to
-randomise the punch inside a ten-minute band, but the punch was landing at the
-same minute (09:08 IST) every single day, so whatever the window was doing, it
-was not producing a spread anyone could see. The window is now OFF -- the cron
-fires at an exact minute -- and the spread comes from the sleep below, which
-CloudWatch prints on every run, so "is the jitter working" is a question with
-an answer.
+randomise the punch inside a ten-minute band, and it was configured to, but the
+punch landed on the same minute every single day: this function was invoked at
+09:07:43 +-2s on five consecutive weekdays. The window picks its offset once
+per schedule and then keeps it -- it spreads load across schedules, not across
+days. The window is now OFF, the cron fires on an exact minute, and the spread
+comes from the sleep below, redrawn per invocation and printed to CloudWatch so
+that "is the jitter working" stays a question with an answer.
 
 Failures raise, so the schedule's RetryPolicy gets a chance. A 200 carrying
 {"skipped": true} is not a failure: a paused weekday or a holiday exception is
