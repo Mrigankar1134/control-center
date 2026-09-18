@@ -972,8 +972,21 @@ def sign_in(page: Page, form_url: str) -> None:
     log.info("Signed in successfully: %s", page.url)
 
 
+def _is_scheduled_run() -> bool:
+    """True when a scheduler started this run rather than a person.
+
+    Two things can be the scheduler. GitHub's own `schedule:` event sets
+    GITHUB_EVENT_NAME, and a crontab sets SCHEDULED_RUN=1 (bot/cron.sh does).
+    Both want the jitter and the dashboard's policy gates; a manual run wants
+    neither, because somebody is sitting there watching it.
+    """
+    if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+        return True
+    return (os.getenv("SCHEDULED_RUN") or "").strip().lower() in {"1", "true", "yes"}
+
+
 def randomize_start() -> None:
-    if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
+    if not _is_scheduled_run():
         already_waited = os.environ.get("DISPATCH_DELAY_MS", "")
         if already_waited.isdigit() and int(already_waited) > 0:
             log.info("Manual dispatch already waited; skipping delay.")
@@ -2153,7 +2166,15 @@ def _dashboard_get(path: str) -> Optional[dict]:
 
 
 def check_dashboard_policy() -> None:
-    if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
+    """Holiday exceptions and the paused-weekday switch, read from the console.
+
+    On the GitHub Actions path these gates live in POST /api/dispatch instead,
+    which runs them before the workflow even starts. A crontab has no such
+    stop on the way in, so for a scheduled cron run this is the only thing
+    standing between a holiday and a punch. It no-ops when CONTROL_CENTER_URL
+    is unset, i.e. when there is no console to ask.
+    """
+    if not _is_scheduled_run():
         return
 
     today_str = _ist_now().strftime("%Y-%m-%d")
@@ -2212,7 +2233,15 @@ def _cron_target_utc(expression: str, now: datetime) -> Optional[datetime]:
 
 
 def check_run_freshness() -> None:
-    """Stand down when a scheduled run starts far outside its intended window."""
+    """Stand down when a scheduled run starts far outside its intended window.
+
+    Deliberately still GitHub-only. This exists because GitHub's schedule queue
+    delivered runs hours late; a crontab fires the process at the minute it
+    says or not at all. The one case that does resemble it -- a laptop asleep
+    at 09:15 whose job is replayed at 14:00 by launchd or anacron -- is already
+    caught downstream, where decide_punch() stands down outside
+    CHECKIN_EARLIEST..CHECKIN_LATEST.
+    """
     if os.environ.get("GITHUB_EVENT_NAME") != "schedule":
         return
 

@@ -19,6 +19,9 @@ tsconfig.tsbuildinfo
 .env*.local
 .env.production
 
+# Run logs from bot/cron.sh. Local, and they quote Zoho state.
+logs/
+
 # --- Python bot (bot/) ---
 __pycache__/
 *.py[cod]

@@ -1,12 +1,18 @@
 # Neural Control
 
+> **Branch `xyz`.** This branch runs the bot from a **crontab on your own
+> machine**: no GitHub Actions, no AWS clock, and the console is optional. Start
+> at [`HANDOVER.md`](HANDOVER.md) — it is the whole setup, and it is short.
+> The `main` branch is the Actions + EventBridge + Amplify version, and most of
+> the deployment notes below describe that one.
+
 Monorepo: a Next.js dispatch console at the root, and the Playwright bot it dispatches in `bot/`.
 
 ```
 control-center/
-├── .github/workflows/automation.yml   # runs the bot (cron + workflow_dispatch)
 ├── bot/                               # Python + Playwright automation
 │   ├── bot.py
+│   ├── cron.sh                        # crontab entry point (this branch)
 │   ├── requirements.txt
 │   └── .env.example
 ├── app/                               # Next.js App Router (UI + API routes)
@@ -17,7 +23,7 @@ control-center/
 └── package.json
 ```
 
-**Separation of concerns:** Amplify sees `package.json` at the root, builds the dashboard, and ignores `bot/` entirely. GitHub Actions only ever executes `bot/`. The two meet at one seam: `POST /api/dispatch` calls the GitHub API to fire `automation.yml`.
+**Separation of concerns:** Amplify sees `package.json` at the root, builds the dashboard, and ignores `bot/` entirely. On this branch nothing executes `bot/` except your crontab, so the two halves are fully independent — the console, if you deploy it at all, is a place to read logs and mark holidays, not the thing that starts a run.
 
 Dashboard · Next.js 14 App Router · Neon PostgreSQL · Drizzle ORM · Tailwind · Framer Motion.
 Bot · Python 3.10 · Playwright · IMAP OTP retrieval.
@@ -41,21 +47,35 @@ python bot/bot.py
 
 ## Deployment
 
-**Web — AWS Amplify.** Connect the repo; Amplify detects Next.js and provisions SSR compute. `amplify.yml` writes the console's environment variables into `.env.production` during `preBuild`, because the SSR Lambda does not inherit them automatically. Set every variable listed in that file under *App settings → Environment variables*.
+**Bot — your crontab.** This is the whole of it, and
+[`HANDOVER.md`](HANDOVER.md) walks through it properly:
 
-**Bot — GitHub Actions.** Nothing to deploy. `automation.yml` runs on `workflow_dispatch` — from the console, or from the EventBridge scheduler that holds the clock. Its secrets live in *Settings → Secrets and variables → Actions*, not in Amplify:
+```cron
+15 9  * * 1-5  /path/to/control-center/bot/cron.sh ACTION_ALPHA
+45 18 * * 1-5  /path/to/control-center/bot/cron.sh ACTION_BETA
+```
 
-| Secret | Purpose |
-| --- | --- |
-| `ZOHO_EMAIL` / `ZOHO_PASSWORD` | Zoho People sign-in. |
-| `GMAIL_ADDRESS` / `GMAIL_APP_PASSWORD` | IMAP inbox the OTP arrives in. |
-| `CONTROL_CENTER_URL` | Deployed dashboard base URL, e.g. `https://main.xxxx.amplifyapp.com`. Unset = the bot skips its policy check and always runs. |
-| `DISPATCH_SECRET` | Sent as a bearer token on those reads. |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional run notifications; both or neither. |
+`bot/cron.sh` establishes what cron does not give you — the virtualenv, the
+working directory, `.env` — sleeps a random 0—5 minutes so the punch does not
+land on the same second daily, runs the bot, and logs to `logs/`. Credentials
+live in `.env` at the repo root; there are no CI secrets on this branch because
+there is no CI.
 
-The dashboard triggers the workflow with a fine-grained PAT in `GITHUB_TOKEN` carrying **Actions: read and write** on this repo.
+**Web — AWS Amplify, and entirely optional.** Nothing above needs it. Deploy it
+if you want the console's run logs, schedule matrix and holiday exceptions;
+connect the repo and Amplify detects Next.js. `amplify.yml` writes the console's
+environment variables into `.env.production` during `preBuild`, because the SSR
+Lambda does not inherit them automatically. Set every variable listed in that
+file under *App settings — Environment variables*.
 
-**Clock — AWS EventBridge Scheduler.** See [`infra/eventbridge/`](infra/eventbridge/). GitHub's `schedule:` event is best-effort and was arriving **3 h 20 m – 4 h 50 m late every weekday**, so the morning cron landed past the 10:30 window and stood down; the repo's own `workflow_dispatch` runs over the same period started within seconds. EventBridge now calls `POST /api/dispatch` on time and that fires the dispatch. The two GitHub crons are kept as a backup — a duplicate is vetoed, a late one stands down.
+Point the bot at it by setting `CONTROL_CENTER_URL` and `DISPATCH_SECRET` in
+`.env`, and a scheduled run will then also stand down on a marked holiday or a
+paused weekday, and report each punch back. Leave them unset and those checks
+are skipped silently.
+
+The console's manual-dispatch button drives GitHub `workflow_dispatch`, which
+this branch has removed — so on `xyz` the console reports and gates, but does
+not start runs. Run `./bot/cron.sh ACTION_ALPHA` yourself instead.
 
 ## The dashboard is the source of truth
 
