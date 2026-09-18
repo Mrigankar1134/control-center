@@ -990,13 +990,36 @@ def randomize_start() -> None:
 
 TOTAL_TIME_SELECTOR = "#totalInTime"
 ATT_STATUS_SELECTOR = "#att_status"
-REQUIRED_MINUTES = 9 * 60 + 30
+# The working day the check-out guard enforces. 9.5h is what Zoho asks of this
+# account; another company asks for something else, so it is a knob rather than
+# a code edit. Anything unparseable or <= 0 falls back to the default, because
+# a bad value here would either punch out early every day or never punch out.
+DEFAULT_REQUIRED_MINUTES = 9 * 60 + 30
+
+
+def _required_minutes() -> int:
+    raw = (os.getenv("REQUIRED_MINUTES") or "").strip()
+    if not raw:
+        return DEFAULT_REQUIRED_MINUTES
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("REQUIRED_MINUTES=%r is not a number; using %d.", raw, DEFAULT_REQUIRED_MINUTES)
+        return DEFAULT_REQUIRED_MINUTES
+    if value <= 0:
+        log.warning("REQUIRED_MINUTES=%d is not positive; using %d.", value, DEFAULT_REQUIRED_MINUTES)
+        return DEFAULT_REQUIRED_MINUTES
+    return value
+
+
+REQUIRED_MINUTES = _required_minutes()
+REQUIRED_LABEL = f"{REQUIRED_MINUTES // 60}h {REQUIRED_MINUTES % 60}m".replace(" 0m", "")
 
 # --- The employee card -----------------------------------------------------
 # Top-left of My Space, and the only part of the page the punch logic may
 # believe. Its rows, in order:
 #
-#     153 - Mrigankar Sonowal      identity
+#     153 - Employee Name          identity (yours, whatever it is)
 #     Management Trainee           designation
 #     In                           status - In or Out
 #     02 : 07 : 29                 elapsed, one span per digit group;
@@ -1660,13 +1683,13 @@ def verify_checkout_eligibility(page: Page) -> None:
             else f"which is past the {CHECKOUT_DEADLINE} deadline"
         )
         send_telegram_msg(
-            f"🚫 Not checking out: only {hours}h {minutes}m logged, 9.5h needs "
+            f"🚫 Not checking out: only {hours}h {minutes}m logged, {REQUIRED_LABEL} needs "
             f"{shortfall} more minutes (eligible {eligible_at.strftime('%H:%M')} IST) - "
             f"{reason}. Check out manually when you are ready."
         )
         raise AutomationError(
             f"SAFETY ABORT: Attempting to check out too early. "
-            f"Only {hours}h {minutes}m elapsed. 9.5 hours ({REQUIRED_MINUTES}m) required. "
+            f"Only {hours}h {minutes}m elapsed. {REQUIRED_LABEL} ({REQUIRED_MINUTES}m) required. "
             f"Eligible at {eligible_at.strftime('%H:%M')} IST - {reason}."
         )
 
@@ -2421,6 +2444,40 @@ def build_proxy_config() -> Optional[dict]:
     return proxy
 
 
+# Zoho geofences the punch, so the browser has to report a location the
+# account is allowed to punch from, and the office it is allowed to punch from
+# is not the same office for everyone. Defaults to Pune, which is where this
+# was written; anyone else sets PUNCH_LATITUDE / PUNCH_LONGITUDE rather than
+# editing this file. LOCALE and TIMEZONE_ID move with it -- an account in
+# another country punching from en-IN / Asia/Kolkata is a mismatch Zoho can
+# see.
+DEFAULT_LATITUDE = 18.506154
+DEFAULT_LONGITUDE = 73.761416
+
+
+def build_geolocation() -> dict:
+    """The coordinates the browser reports, from PUNCH_LATITUDE/LONGITUDE."""
+    def coord(name: str, fallback: float, limit: float) -> float:
+        raw = (os.getenv(name) or "").strip()
+        if not raw:
+            return fallback
+        try:
+            value = float(raw)
+        except ValueError:
+            log.warning("%s=%r is not a number; using %s.", name, raw, fallback)
+            return fallback
+        if not -limit <= value <= limit:
+            log.warning("%s=%s is out of range; using %s.", name, value, fallback)
+            return fallback
+        return value
+
+    lat = coord("PUNCH_LATITUDE", DEFAULT_LATITUDE, 90.0)
+    lon = coord("PUNCH_LONGITUDE", DEFAULT_LONGITUDE, 180.0)
+    if (lat, lon) != (DEFAULT_LATITUDE, DEFAULT_LONGITUDE):
+        log.info("Reporting geolocation %s, %s.", lat, lon)
+    return {"latitude": lat, "longitude": lon}
+
+
 def apply_stealth(page: Page) -> bool:
     """
     Mask headless fingerprints (navigator.webdriver, plugins, chrome runtime).
@@ -2515,10 +2572,10 @@ def run() -> None:
         state_path = load_storage_state()
         context = browser.new_context(
             viewport={"width": 1280, "height": 800},
-            geolocation={"latitude": 18.506154, "longitude": 73.761416},
+            geolocation=build_geolocation(),
             permissions=["geolocation"],
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
+            locale=os.getenv("LOCALE", "en-IN"),
+            timezone_id=os.getenv("TIMEZONE_ID", "Asia/Kolkata"),
             storage_state=state_path,
             user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
