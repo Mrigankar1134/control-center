@@ -74,8 +74,10 @@ jobs:
       # left unset falls back to the Pune / en-IN / Asia/Kolkata defaults baked
       # into bot.py, and a malformed value is rejected there in favour of the
       # default rather than punching from nowhere.
-      PUNCH_LATITUDE: ${{ vars.PUNCH_LATITUDE }}
-      PUNCH_LONGITUDE: ${{ vars.PUNCH_LONGITUDE }}
+      # Accepted from either the Variables tab (preferred, plaintext, easy to
+      # verify) or Secrets, so it works wherever you happened to put them.
+      PUNCH_LATITUDE: ${{ vars.PUNCH_LATITUDE || secrets.PUNCH_LATITUDE }}
+      PUNCH_LONGITUDE: ${{ vars.PUNCH_LONGITUDE || secrets.PUNCH_LONGITUDE }}
       LOCALE: ${{ vars.LOCALE }}
       TIMEZONE_ID: ${{ vars.TIMEZONE_ID }}
       # Minutes the check-out guard requires before it will punch out (default
