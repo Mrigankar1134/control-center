@@ -1,10 +1,8 @@
 # Neural Control
 
-> **Branch `xyz`.** This branch runs the bot from a **crontab on your own
-> machine**: no GitHub Actions, no AWS clock, and the console is optional. Start
-> at [`HANDOVER.md`](HANDOVER.md) — it is the whole setup, and it is short.
-> The `main` branch is the Actions + EventBridge + Amplify version, and most of
-> the deployment notes below describe that one.
+> **The bot runs from a `crontab` on a machine you control** — no GitHub
+> Actions, no AWS clock. The Next.js console is optional. Start at
+> [`HANDOVER.md`](HANDOVER.md); it is the whole setup, and it is short.
 
 Monorepo: a Next.js dispatch console at the root, and the Playwright bot it dispatches in `bot/`.
 
@@ -12,7 +10,7 @@ Monorepo: a Next.js dispatch console at the root, and the Playwright bot it disp
 control-center/
 ├── bot/                               # Python + Playwright automation
 │   ├── bot.py
-│   ├── cron.sh                        # crontab entry point (this branch)
+│   ├── cron.sh                        # crontab entry point — the scheduler
 │   ├── requirements.txt
 │   └── .env.example
 ├── app/                               # Next.js App Router (UI + API routes)
@@ -74,7 +72,7 @@ paused weekday, and report each punch back. Leave them unset and those checks
 are skipped silently.
 
 The console's manual-dispatch button drives GitHub `workflow_dispatch`, which
-this branch has removed — so on `xyz` the console reports and gates, but does
+this project no longer includes — so the console reports and gates, but does
 not start runs. Run `./bot/cron.sh ACTION_ALPHA` yourself instead.
 
 ## The dashboard is the source of truth
@@ -86,14 +84,14 @@ The bot keeps no schedule of its own, and two questions are asked before any sch
 
 There is deliberately **no `SKIP_DATES` secret**. A second copy of the holiday list would silently disagree with the calendar UI.
 
-**Both gates live in `POST /api/dispatch`** (`exceptionForToday()` and `scheduleArmedToday()`), so they run *before* the workflow is started. They used to live in the bot's `check_dashboard_policy()`, which asked the dashboard over HTTP — but that only ran on a `schedule` event, and since EventBridge took over the clock every scheduled run arrives as a `workflow_dispatch`. Leaving them there would have quietly un-armed both. `check_dashboard_policy()` still exists and still guards the backup crons.
+**The bot enforces both gates itself**, in `check_dashboard_policy()`, which reads the console over HTTP (`GET /api/exceptions` and `GET /api/schedule`) at the start of every scheduled run. A run counts as scheduled when `bot/cron.sh` sets `SCHEDULED_RUN=1` — see `_is_scheduled_run()` — so a crontab punch is gated and a hand-run `DISPATCH_SOURCE=MANUAL python bot/bot.py` is not. When `CONTROL_CENTER_URL` is unset there is no console to ask, and the checks are skipped rather than failing the run.
 
 Two consequences worth knowing:
 
 - **Manual dispatch is never blocked.** A human tapping the button on an excepted day means it; the API permits it and the console banners why.
 - **The gates fail open.** If the lookup fails the run proceeds, because a missed attendance punch costs more than a punch on a holiday.
 
-One thing the move gave up: `randomOffsetMinutes` no longer drives scheduled jitter. That ceiling reached the bot in the same `GET /api/schedule` response and was slept in the runner; the jitter is now the EventBridge schedule's flexible time window. [`infra/eventbridge/README.md`](infra/eventbridge/README.md) explains why, and how to change it.
+The jitter that keeps the punch off the same second every day is `bot/cron.sh`'s own sleep — a random 0–`DISPATCH_MAX_JITTER_SEC` (default 300s) before the punch, redrawn each run, so cron's exact-minute firing does not read as a machine. The console's `randomOffsetMinutes` is not read by the cron path; if you run the console, keep the two in step by hand.
 
 `DISPATCH_DELAY_MS` is reported for correlation only — the console already served that delay in the browser before calling the API, so the bot must not sleep on it a second time.
 
@@ -217,8 +215,8 @@ Two related traps this closes:
 
 - **The 9.5 h check-out guard refuses to guess.** If neither the API payload nor the widget yields an elapsed time, the bot **aborts instead of checking out**. It used to warn and proceed, which is how a 2 h 27 m day got punched out at 12:31 on 3 Aug 2026. An unverified check-out is a payroll problem; a missed one is a two-second manual fix. `ALLOW_UNVERIFIED_CHECKOUT=true` overrides it if you ever need to.
 
-  **The guard applies to unattended runs only.** A manual dispatch skips it: the operator pressed the button and can see the widget themselves, and holding or aborting a hand-pressed check-out just means it never happens. Telegram still says the requirement went unchecked, so an unverified punch leaves a trace. "Manual" is read from `DISPATCH_SOURCE` (`MANUAL`), never from the event name — since EventBridge drives the clock, a scheduled run is *also* a `workflow_dispatch`, it just carries `source=CRON`. Anything unrecognised counts as not-manual, so a blank source keeps the guard rather than losing it.
-- **Stale scheduled runs stand down.** GitHub's cron is best-effort and delays of hours are exactly what happened here — which is why the clock moved to EventBridge and these crons are now only a backup. The workflow passes `github.event.schedule`, and a late run is judged against the window its cron was for: a delayed morning run still punches while the `CHECKIN_LATEST` (10:30) window is open, a delayed evening run while `CHECKOUT_DEADLINE` (20:00) is, and anything past its window — or more than `MAX_SCHEDULE_LATENESS_MIN` (default 240) late — exits without punching and says so on Telegram. Either way the delay is reported. Manual dispatch is never blocked, and a run with no cron info proceeds rather than being blocked blindly.
+  **The guard applies to unattended runs only.** A hand-run punch skips it: the operator can see the widget themselves, and holding or aborting a hand-pressed check-out just means it never happens. Telegram still says the requirement went unchecked, so an unverified punch leaves a trace. "Manual" is read from `DISPATCH_SOURCE` — `bot/cron.sh` sets `DISPATCH_SOURCE=CRON`, so a crontab punch keeps the guard, while a hand-run `DISPATCH_SOURCE=MANUAL` skips it. Anything unrecognised counts as not-manual, so a blank source keeps the guard rather than losing it.
+- **A late-woken run stands down on its own.** `check_run_freshness()` targets the old GitHub-schedule delay and is inert under cron, but the window checks in `decide_punch()` catch the case that matters here: a machine asleep at 09:15 whose crontab job is replayed hours later refuses to punch, because it is past the `CHECKIN_LATEST` (10:30) window. A delayed evening run is judged against `CHECKOUT_DEADLINE` (20:00) the same way. A hand-run punch is never blocked.
 
 ### Failure handling
 

@@ -1,15 +1,10 @@
-# Setting this up as your own (cron edition)
+# Setting this up as your own
 
-This branch punches you in and out of Zoho People from a **crontab on a machine
-you control**. No GitHub Actions, no AWS, no dashboard required.
+This punches you in and out of Zoho People from a **crontab on a machine you
+control**. No GitHub Actions, no AWS, no dashboard required.
 
 Everything specific to the person it was built for is an environment variable,
 so making it yours is configuration, not code editing.
-
-> **Which branch am I on?** This is `xyz`. The `main` branch runs the same bot
-> from GitHub Actions on an AWS EventBridge clock, with a web console in front
-> of it. If you want that instead, read `HANDOVER.md` there — it is a different
-> and much longer setup.
 
 ## What you need
 
@@ -31,7 +26,7 @@ Optional: a Telegram bot token, for a message with a screenshot after each run.
 ### 1. Get the code
 
 ```bash
-git clone -b xyz https://github.com/Mrigankar1134/control-center.git
+git clone https://github.com/Mrigankar1134/control-center.git
 cd control-center
 ```
 
