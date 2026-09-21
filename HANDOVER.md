@@ -98,6 +98,15 @@ Note the deployed URL, e.g. `https://main.d3xxxx.amplifyapp.com`.
 | `STATE_KEY` | `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` — encrypts the saved Zoho session. Without it the bot repeats the full OTP sign-in every run. |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Optional. Both or neither. |
 
+**Location and per-person config go in the sibling *Variables* tab**, not Secrets — same page, *Settings → Secrets and variables → Actions → Variables*. They are not credentials, and plaintext makes them easy to verify. The workflow reads them; anything left unset falls back to the Pune / `en-IN` / `Asia/Kolkata` defaults baked into `bot.py`.
+
+| Variable | Value |
+| --- | --- |
+| `PUNCH_LATITUDE` / `PUNCH_LONGITUDE` | **Your office** — Zoho geofences the punch. The default is someone else's. |
+| `LOCALE` / `TIMEZONE_ID` | Only if you are outside India (`en-IN` / `Asia/Kolkata`). |
+| `FORM_URL` | Only if your data centre is not `accounts.zoho.in` (`.com` / `.eu` / `.com.au`). |
+| `REQUIRED_MINUTES` | Only if the required day is not 9h 30m (`570`). |
+
 ### 6. Run it once by hand, locally
 
 Do this before automating anything. It is the step that tells you whether the

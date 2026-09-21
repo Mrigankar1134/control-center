@@ -63,7 +63,24 @@ jobs:
       ZOHO_PASSWORD: ${{ secrets.ZOHO_PASSWORD }}
       GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
       GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-      FORM_URL: ${{ inputs.form_url }}
+      # A manual dispatch may override the data centre; a scheduled run reads it
+      # from the repository variable, so it is no longer empty on cron runs.
+      FORM_URL: ${{ inputs.form_url || vars.FORM_URL }}
+      # --- Where the punch claims to be, and who it claims to be ---
+      # Zoho geofences the punch, so these must match the account's office.
+      # They are repository *Variables* (Settings -> Secrets and variables ->
+      # Actions -> Variables), NOT secrets: an office location and a timezone
+      # are not credentials, and plaintext variables are easy to verify. Any
+      # left unset falls back to the Pune / en-IN / Asia/Kolkata defaults baked
+      # into bot.py, and a malformed value is rejected there in favour of the
+      # default rather than punching from nowhere.
+      PUNCH_LATITUDE: ${{ vars.PUNCH_LATITUDE }}
+      PUNCH_LONGITUDE: ${{ vars.PUNCH_LONGITUDE }}
+      LOCALE: ${{ vars.LOCALE }}
+      TIMEZONE_ID: ${{ vars.TIMEZONE_ID }}
+      # Minutes the check-out guard requires before it will punch out (default
+      # 570 = 9h 30m). Set it if the employer's day differs.
+      REQUIRED_MINUTES: ${{ vars.REQUIRED_MINUTES }}
       HEADLESS: "true"
       PYTHONUNBUFFERED: "1"
       DISPATCH_MODE: ${{ inputs.mode }}
